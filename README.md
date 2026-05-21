@@ -87,6 +87,16 @@ chmod +x run.sh
 ./run.sh
 ```
 
+## Method C: Windows startup script
+```powershell
+run.bat
+```
+
+With arguments:
+```powershell
+run.bat left.dng right.dng
+```
+
 ## Passing images at startup
 ```bash
 python shotwell_compare.py left.dng right.dng
