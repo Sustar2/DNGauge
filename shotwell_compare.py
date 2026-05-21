@@ -18,7 +18,7 @@ from typing import Optional
 import numpy as np
 
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QPainter
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QTransform
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -356,7 +356,9 @@ class SyncView(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
-        self.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        # 稳定性优先：避免大图高倍率时的高开销插值导致崩溃
+        self.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
 
         self._suppress = False
         self._interp = 0.0
@@ -518,14 +520,9 @@ class SyncView(QGraphicsView):
         return max(mn, min(mx, zoom))
 
     def _apply_zoom_from_interp(self):
-        now = self.transform().m11()
         target = self._zoom_for_interp(self._interp)
-        if now <= 0:
-            self.resetTransform()
-            self.scale(target, target)
-            return
-        ratio = target / now
-        self.scale(ratio, ratio)
+        # 用绝对变换，避免反复 scale() 累积误差/极端比例导致的不稳定
+        self.setTransform(QTransform.fromScale(target, target))
 
     def _pick_pixel(self, pos):
         if not self.has_image():
