@@ -36,14 +36,28 @@ pip install -U pip
 pip install -r requirements.txt
 ```
 
-### Windows (PowerShell)
-```powershell
+### Windows (Command Prompt / PowerShell)
+
+> **If "python3" doesn't work**, try full path: `C:\Python311\python -m venv .venv`
+
+```cmd
 cd DNG_COMPARE
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
-pip install -r requirements.txt
+python3 -m venv .venv
 ```
+
+> **Activate the venv** — pick one:
+> - **CMD**: `.venv\Scripts\activate`
+> - **PowerShell**: `.\.venv\Scripts\Activate.ps1`
+
+```cmd
+.venv\Scripts\activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+```
+
+> **PowerShell execution policy**: If `.ps1` is blocked, either use
+> CMD's `.venv\Scripts\activate` instead, or run in Admin PowerShell:
+> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
 
 > If `rawpy` installation fails, it's usually due to system environment or wheel mismatch. Try upgrading pip first:
 > `python -m pip install -U pip setuptools wheel`
