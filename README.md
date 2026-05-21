@@ -81,20 +81,10 @@ pip install -r requirements.txt
 python shotwell_compare.py
 ```
 
-## Method B: Using the startup script
+## Method B: Using the startup script[only can be used in Linux]
 ```bash
 chmod +x run.sh
 ./run.sh
-```
-
-## Method C: Windows startup script
-```powershell
-run.bat
-```
-
-With arguments:
-```powershell
-run.bat left.dng right.dng
 ```
 
 ## Passing images at startup
