@@ -53,6 +53,7 @@ RAW_EXTS = {
     ".nef", ".nrw", ".orf", ".ptx", ".pef", ".pxn", ".r3d", ".raf", ".raw", ".rw2", ".rwl",
     ".rwz", ".x3f", ".srw",
 }
+DROP_EXTS = RAW_EXTS | {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 DEFAULT_ADJUSTMENTS = {
     "exposure": 0,
@@ -339,9 +340,12 @@ class ShotwellRawDecoder:
 class SyncView(QGraphicsView):
     state_changed = pyqtSignal(object)
     pixel_picked = pyqtSignal(object)
+    file_dropped = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
         self.setScene(QGraphicsScene(self))
         self.item = QGraphicsPixmapItem()
         # Shotwell scaled_read() 最终 resize 使用 BILINEAR；这里用 Smooth 更接近
@@ -363,6 +367,10 @@ class SyncView(QGraphicsView):
         self._suppress = False
         self._interp = 0.0
         self._probe_enabled = False
+        self._in_resize = False
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._finish_resize_update)
 
         self.horizontalScrollBar().valueChanged.connect(self._emit_state)
         self.verticalScrollBar().valueChanged.connect(self._emit_state)
@@ -435,10 +443,9 @@ class SyncView(QGraphicsView):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if self.has_image():
-            # Shotwell 逻辑：窗口变化时保持 interpolation 档位
-            self._apply_zoom_from_interp()
-        self._emit_state()
+        # 避免窗口放大/全屏时触发大量同步事件导致卡死
+        self._in_resize = True
+        self._resize_timer.start(80)
 
     def mouseReleaseEvent(self, e):
         super().mouseReleaseEvent(e)
@@ -451,8 +458,40 @@ class SyncView(QGraphicsView):
             return
         super().mousePressEvent(event)
 
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if not md or not md.hasUrls():
+            event.ignore()
+            return
+        for url in md.urls():
+            if not url.isLocalFile():
+                continue
+            p = url.toLocalFile()
+            if os.path.isfile(p) and Path(p).suffix.lower() in DROP_EXTS:
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not md or not md.hasUrls():
+            event.ignore()
+            return
+        for url in md.urls():
+            if not url.isLocalFile():
+                continue
+            p = url.toLocalFile()
+            if os.path.isfile(p) and Path(p).suffix.lower() in DROP_EXTS:
+                self.file_dropped.emit(p)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
     def _emit_state(self):
-        if self._suppress or not self.has_image():
+        if self._suppress or self._in_resize or not self.has_image():
             return
         h = self.horizontalScrollBar()
         v = self.verticalScrollBar()
@@ -548,10 +587,18 @@ class SyncView(QGraphicsView):
             "dtype": "uint8",
         })
 
+    def _finish_resize_update(self):
+        self._in_resize = False
+        if self.has_image():
+            # Shotwell 逻辑：窗口变化后保持同一缩放档位
+            self._apply_zoom_from_interp()
+        self._emit_state()
+
 
 class Pane(QWidget):
     state_changed = pyqtSignal(object)
     pixel_picked = pyqtSignal(object)
+    file_dropped = pyqtSignal(str)
 
     def __init__(self, title: str):
         super().__init__()
@@ -571,6 +618,7 @@ class Pane(QWidget):
 
         self.v.state_changed.connect(self.state_changed)
         self.v.pixel_picked.connect(self.pixel_picked)
+        self.v.file_dropped.connect(self.file_dropped)
 
     def set_baseline(self, path: str, rgb: np.ndarray, raw_info: Optional[dict] = None):
         self.p.setText(path)
@@ -732,6 +780,7 @@ class Window(QMainWindow):
         super().__init__()
         self.setWindowTitle("DNG_COMPARE - Shotwell RAW pipeline")
         self.resize(1500, 900)
+        self.setAcceptDrops(True)
         self._apply_modern_theme()
 
         self.left = Pane("左图")
@@ -747,6 +796,8 @@ class Window(QMainWindow):
         self.right.state_changed.connect(lambda s: self._sync(self.left, s))
         self.left.pixel_picked.connect(lambda p, pane=self.left: self._on_pixel_picked("左图", pane, p))
         self.right.pixel_picked.connect(lambda p, pane=self.right: self._on_pixel_picked("右图", pane, p))
+        self.left.file_dropped.connect(lambda path: self._load_path_into_pane(self.left, path))
+        self.right.file_dropped.connect(lambda path: self._load_path_into_pane(self.right, path))
         self.left_adj.changed.connect(lambda p: self._on_adjust(self.left, p))
         self.right_adj.changed.connect(lambda p: self._on_adjust(self.right, p))
         self.left_adj.dragging_changed.connect(lambda f: self._on_adjust_dragging(self.left, f))
@@ -1047,6 +1098,9 @@ class Window(QMainWindow):
     def _sync(self, dst: Pane, s: ViewState):
         if self._single_view:
             return
+        # 避免窗口 resize/fullscreen 过程中的双向联动风暴
+        if self.left.v._in_resize or self.right.v._in_resize:
+            return
         if not self._link or self._sync_lock or not dst.v.has_image():
             return
         self._sync_lock = True
@@ -1087,6 +1141,9 @@ class Window(QMainWindow):
         path = self._pick_file()
         if not path:
             return
+        self._load_path_into_pane(pane, path)
+
+    def _load_path_into_pane(self, pane: Pane, path: str):
         self.msg.setText(f"加载中: {os.path.basename(path)} ...")
         vp = pane.v.viewport().size()
         target = (vp.width(), vp.height())
@@ -1104,6 +1161,58 @@ class Window(QMainWindow):
                 self.load_done.emit(pane, path, None, e)
 
         fut.add_done_callback(done_cb)
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if not md or not md.hasUrls():
+            event.ignore()
+            return
+        for url in md.urls():
+            if url.isLocalFile():
+                ext = Path(url.toLocalFile()).suffix.lower()
+                if ext in DROP_EXTS:
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not md or not md.hasUrls():
+            event.ignore()
+            return
+        files = []
+        for url in md.urls():
+            if not url.isLocalFile():
+                continue
+            p = url.toLocalFile()
+            if os.path.isfile(p) and Path(p).suffix.lower() in DROP_EXTS:
+                files.append(p)
+        if not files:
+            event.ignore()
+            return
+
+        # 单图模式：只加载左图
+        if self._single_view:
+            self._load_path_into_pane(self.left, files[0])
+            event.acceptProposedAction()
+            return
+
+        # 双图模式：优先一左一右
+        if len(files) >= 2:
+            self._load_path_into_pane(self.left, files[0])
+            self._load_path_into_pane(self.right, files[1])
+        else:
+            # 仅一个文件时，优先填充空的一侧
+            if not self.left.v.has_image():
+                self._load_path_into_pane(self.left, files[0])
+            elif not self.right.v.has_image():
+                self._load_path_into_pane(self.right, files[0])
+            else:
+                self._load_path_into_pane(self.left, files[0])
+        event.acceptProposedAction()
 
     def _on_load_done(self, pane: Pane, path: str, rgb: Optional[np.ndarray], raw_or_err):
         if rgb is None:
