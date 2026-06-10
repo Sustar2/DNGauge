@@ -16,6 +16,8 @@ This folder contains all build and distribution assets for `DNGauge`.
   - builds `..\dist\DNGauge.exe`
 - `package_portable_linux.sh`
   - creates `../release/DNGauge-linux-portable`
+- `package_windows_portable.bat`
+  - creates `..\release\DNGauge-windows-portable`
 - `portable_assets/`
   - launcher template and end-user readmes
 
@@ -32,4 +34,5 @@ Windows:
 
 ```cmd
 packaging\build_windows.bat
+packaging\package_windows_portable.bat
 ```
