@@ -10,6 +10,7 @@ Reference (Shotwell source):
 
 import os
 import sys
+import tempfile
 import concurrent.futures
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +18,15 @@ from typing import Optional
 
 import numpy as np
 
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QTransform
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QTransform, QImageReader
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGraphicsPixmapItem,
@@ -33,6 +39,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +48,20 @@ try:
     import rawpy
 except Exception as e:
     raise RuntimeError("需要 rawpy 才能按 Shotwell RAW 链路解码") from e
+
+try:
+    from pidng.core import RAW2DNG, DNGTags, Tag
+    from pidng.defs import (
+        CalibrationIlluminant,
+        CFAPattern,
+        DNGVersion,
+        Orientation,
+        PhotometricInterpretation,
+        PreviewColorSpace,
+    )
+    PIDNG_AVAILABLE = True
+except Exception:
+    PIDNG_AVAILABLE = False
 
 try:
     from PIL import Image
@@ -64,6 +85,27 @@ DEFAULT_ADJUSTMENTS = {
     "highlights": 0,
     "shadows": 0,
 }
+
+DNG_STYLE_CCM = np.array(
+    [
+        [0.6668, -0.1588, -0.0857],
+        [-0.5739, 1.3898, 0.1430],
+        [-0.1378, 0.2651, 0.6036],
+    ],
+    dtype=np.float32,
+)
+
+DNG_STYLE_CCM_RATIONALS = [
+    [+6668, 10000],
+    [-1588, 10000],
+    [-857, 10000],
+    [-5739, 10000],
+    [13898, 10000],
+    [+1430, 10000],
+    [-1378, 10000],
+    [+2651, 10000],
+    [+6036, 10000],
+]
 
 
 def _slider_style() -> str:
@@ -237,6 +279,273 @@ def rgb_to_qimage(rgb: np.ndarray) -> QImage:
     return qimg.copy()
 
 
+def qimage_to_rgb_array(qimg: QImage) -> np.ndarray:
+    img = qimg.convertToFormat(QImage.Format_RGB888)
+    w = img.width()
+    h = img.height()
+    bpl = img.bytesPerLine()
+    ptr = img.bits()
+    ptr.setsize(h * bpl)
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, bpl)
+    return np.ascontiguousarray(arr[:, : w * 3].reshape(h, w, 3))
+
+
+def fit_dimensions(full_w: int, full_h: int, target_w: int, target_h: int) -> tuple[int, int]:
+    if full_w <= 0 or full_h <= 0 or target_w <= 0 or target_h <= 0:
+        return max(1, full_w), max(1, full_h)
+    scale = min(target_w / float(full_w), target_h / float(full_h), 1.0)
+    return max(1, int(round(full_w * scale))), max(1, int(round(full_h * scale)))
+
+
+def raw_to_display_rgb(
+    raw: np.ndarray,
+    display_bits: Optional[int] = None,
+    black_level: float = 0.0,
+    white_level: Optional[float] = None,
+    exposure_gain: float = 1.0,
+) -> np.ndarray:
+    arr = raw.astype(np.float32)
+    if display_bits is not None and 1 <= int(display_bits) <= 16:
+        hi_default = float((1 << int(display_bits)) - 1)
+        lo = float(max(0.0, black_level))
+        hi = float(hi_default if white_level is None else max(lo + 1.0, white_level))
+        norm = np.clip((arr - lo) / max(1.0, (hi - lo)), 0.0, 1.0)
+        norm = np.clip(norm * float(max(0.01, exposure_gain)), 0.0, 1.0)
+    else:
+        lo = float(np.percentile(arr, 1.0))
+        hi = float(np.percentile(arr, 99.5))
+        if hi <= lo:
+            lo = float(arr.min())
+            hi = float(arr.max()) if float(arr.max()) > lo else lo + 1.0
+        norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    g = (norm * 255.0).astype(np.uint8)
+    return np.stack([g, g, g], axis=-1)
+
+
+def dng_style_linear_rgb_to_srgb(
+    rgb: np.ndarray,
+    black_level: float,
+    white_level: float,
+    exposure_gain: float,
+    wb: tuple[float, float, float],
+) -> np.ndarray:
+    lo = float(max(0.0, black_level))
+    hi = float(max(lo + 1.0, white_level))
+    arr = np.clip((rgb - lo) / max(1.0, hi - lo), 0.0, 1.0)
+    arr = np.clip(arr * float(max(0.01, exposure_gain)), 0.0, 1.0)
+    gains = np.array(wb, dtype=np.float32)
+    gains = np.where(gains > 1e-6, gains, 1.0)
+    arr *= gains.reshape(1, 1, 3)
+    arr = arr @ DNG_STYLE_CCM.T
+    arr *= np.float32(2.0 ** -1.5)
+    arr = np.clip(arr, 0.0, 1.0)
+    srgb = np.where(arr <= 0.0031308, arr * 12.92, 1.055 * np.power(arr, 1.0 / 2.4) - 0.055)
+    return np.clip(srgb * 255.0, 0, 255).astype(np.uint8)
+
+
+def _pattern_to_pidng(pattern: str):
+    if not PIDNG_AVAILABLE:
+        return None
+    return {
+        "RGGB": CFAPattern.RGGB,
+        "BGGR": CFAPattern.BGGR,
+        "GRBG": CFAPattern.GRBG,
+        "GBRG": CFAPattern.GBRG,
+    }.get(str(pattern).upper(), CFAPattern.RGGB)
+
+
+def _wb_to_as_shot_neutral(wb_enabled: bool, wb: tuple[float, float, float]):
+    if not wb_enabled:
+        return [[1000, 1000], [1000, 1000], [1000, 1000]]
+    gains = np.array(wb, dtype=np.float64)
+    gains = np.where(gains > 1e-6, gains, 1.0)
+    neutral = 1.0 / gains
+    neutral = np.clip(neutral, 1e-6, 64.0)
+    return [[int(round(v * 1000.0)), 1000] for v in neutral.tolist()]
+
+
+def _plain_raw_temp_dng_to_rgb(
+    raw: np.ndarray,
+    pattern: str,
+    bit: int,
+    black_level: float,
+    white_level: float,
+    wb_enabled: bool,
+    wb: tuple[float, float, float],
+) -> Optional[np.ndarray]:
+    if not PIDNG_AVAILABLE:
+        return None
+
+    bits_per_sample = max(1, min(16, int(bit)))
+    tag_white = int(max(1.0, min(float((1 << bits_per_sample) - 1), float(white_level))))
+    tag_black = int(max(0.0, min(float(tag_white - 1), float(black_level))))
+
+    tags = DNGTags()
+    tags.set(Tag.ImageLength, int(raw.shape[0]))
+    tags.set(Tag.ImageWidth, int(raw.shape[1]))
+    tags.set(Tag.TileLength, int(raw.shape[0]))
+    tags.set(Tag.TileWidth, int(raw.shape[1]))
+    tags.set(Tag.Orientation, Orientation.Horizontal)
+    tags.set(Tag.PhotometricInterpretation, PhotometricInterpretation.Color_Filter_Array)
+    tags.set(Tag.SamplesPerPixel, 1)
+    tags.set(Tag.BitsPerSample, bits_per_sample)
+    tags.set(Tag.CFARepeatPatternDim, [2, 2])
+    tags.set(Tag.CFAPattern, _pattern_to_pidng(pattern))
+    tags.set(Tag.BlackLevel, tag_black)
+    tags.set(Tag.WhiteLevel, tag_white)
+    tags.set(Tag.ColorMatrix1, DNG_STYLE_CCM_RATIONALS)
+    tags.set(Tag.CalibrationIlluminant1, CalibrationIlluminant.D65)
+    tags.set(Tag.AsShotNeutral, _wb_to_as_shot_neutral(wb_enabled, wb))
+    tags.set(Tag.BaselineExposure, [[-150, 100]])
+    tags.set(Tag.Make, "Camera Brand")
+    tags.set(Tag.Model, "Camera Model")
+    tags.set(Tag.DNGVersion, DNGVersion.V1_4)
+    tags.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
+    tags.set(Tag.PreviewColorSpace, PreviewColorSpace.sRGB)
+
+    fd, tmp_path = tempfile.mkstemp(prefix="dng_compare_", suffix=".dng", dir="/tmp")
+    os.close(fd)
+    try:
+        writer = RAW2DNG()
+        writer.options(tags, path="", compress=False)
+        writer.convert(raw, filename=tmp_path)
+        rgb, _raw_info = ShotwellRawDecoder._load_raw(tmp_path, target_size=None)
+        return rgb
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def render_plain_raw_with_matrix(
+    raw: np.ndarray,
+    pattern: str,
+    black_level: float,
+    white_level: float,
+    exposure_gain: float,
+    wb_enabled: bool,
+    wb: tuple[float, float, float],
+    prefer_temp_dng: bool = True,
+    bit: Optional[int] = None,
+) -> np.ndarray:
+    if prefer_temp_dng and PIDNG_AVAILABLE:
+        rgb = _plain_raw_temp_dng_to_rgb(
+            raw,
+            pattern=pattern,
+            bit=(bit if bit is not None else int(np.ceil(np.log2(max(2.0, float(white_level) + 1.0))))),
+            black_level=black_level,
+            white_level=white_level,
+            wb_enabled=wb_enabled,
+            wb=wb,
+        )
+        if rgb is not None:
+            return rgb
+
+    linear_rgb, _cfa = ShotwellRawDecoder._demosaic_bilinear_linear(raw, pattern)
+    gains = wb if wb_enabled else (1.0, 1.0, 1.0)
+    return dng_style_linear_rgb_to_srgb(
+        linear_rgb,
+        black_level=black_level,
+        white_level=white_level,
+        exposure_gain=exposure_gain,
+        wb=gains,
+    )
+
+
+def render_raw_all_source_rgb(
+    base_rgb: np.ndarray,
+    raw_info: Optional[dict],
+    display_bits: int,
+    black_level: float,
+    white_level: float,
+    exposure_gain: float,
+    wb_enabled: bool,
+    wb: tuple[float, float, float],
+) -> np.ndarray:
+    if raw_info is None:
+        return base_rgb
+    if raw_info.get("plain_raw"):
+        raw = raw_info.get("raw")
+        pattern = raw_info.get("pattern", "RGGB")
+        if raw is not None:
+            return render_plain_raw_with_matrix(
+                raw,
+                str(pattern).upper(),
+                black_level=black_level,
+                white_level=white_level,
+                exposure_gain=exposure_gain,
+                wb_enabled=wb_enabled,
+                wb=wb,
+                bit=int(raw_info.get("bit", display_bits)),
+            )
+    src = base_rgb
+    if wb_enabled:
+        src = apply_wb_rgb(src, wb)
+    return apply_levels_exposure_rgb(src, display_bits, black_level, white_level, exposure_gain)
+
+
+def raw_channel_to_display_rgb(
+    raw: np.ndarray,
+    cfa: np.ndarray,
+    desc: str,
+    mode: str,
+    display_bits: Optional[int] = None,
+    black_level: float = 0.0,
+    white_level: Optional[float] = None,
+    exposure_gain: float = 1.0,
+) -> np.ndarray:
+    mode = mode.upper()
+    if mode == "ALL":
+        return raw_to_display_rgb(raw, display_bits, black_level, white_level, exposure_gain)
+
+    h, w = raw.shape
+    desc = desc or "RGBG"
+    mask = np.zeros((h, w), dtype=bool)
+
+    if mode in ("R", "B"):
+        for i in range(min(len(desc), 8)):
+            if desc[i].upper() == mode:
+                mask |= (cfa == i)
+    elif mode in ("G1", "G2"):
+        gmask = np.zeros((h, w), dtype=bool)
+        for i in range(min(len(desc), 8)):
+            if desc[i].upper() == "G":
+                gmask |= (cfa == i)
+        yy = np.indices((h, w))[0]
+        mask = gmask & ((yy % 2 == 0) if mode == "G1" else (yy % 2 == 1))
+    else:
+        return raw_to_display_rgb(raw, display_bits, black_level, white_level, exposure_gain)
+
+    if not np.any(mask):
+        return raw_to_display_rgb(raw, display_bits, black_level, white_level, exposure_gain)
+
+    sel = np.zeros_like(raw, dtype=raw.dtype)
+    sel[mask] = raw[mask]
+    return raw_to_display_rgb(sel, display_bits, black_level, white_level, exposure_gain)
+
+
+def apply_wb_rgb(rgb: np.ndarray, gains: tuple[float, float, float]) -> np.ndarray:
+    r_gain, g_gain, b_gain = gains
+    arr = rgb.astype(np.float32)
+    arr[..., 0] *= float(r_gain)
+    arr[..., 1] *= float(g_gain)
+    arr[..., 2] *= float(b_gain)
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+def apply_levels_exposure_rgb(
+    rgb: np.ndarray, bit: int, black_level: float, white_level: float, exposure_gain: float
+) -> np.ndarray:
+    maxv = float((1 << max(1, min(16, int(bit)))) - 1)
+    lo = float(max(0.0, black_level)) / maxv
+    hi = float(max(black_level + 1.0, white_level)) / maxv
+    arr = rgb.astype(np.float32) / 255.0
+    arr = np.clip((arr - lo) / max(1e-6, (hi - lo)), 0.0, 1.0)
+    arr = np.clip(arr * float(max(0.01, exposure_gain)), 0.0, 1.0)
+    return (arr * 255.0).astype(np.uint8)
+
+
 def fast_preview_adjust(base_rgb: np.ndarray, params: dict) -> np.ndarray:
     """快速预览：先降采样计算，再放大回原尺寸。"""
     h, w = base_rgb.shape[:2]
@@ -306,11 +615,159 @@ class ShotwellRawDecoder:
         return {kk: vv for kk, vv in k.items() if vv is not None}
 
     @classmethod
-    def load(cls, path: str, target_size: Optional[tuple[int, int]] = None) -> tuple[np.ndarray, Optional[dict]]:
+    def load(
+        cls,
+        path: str,
+        target_size: Optional[tuple[int, int]] = None,
+        plain_raw_cfg: Optional[dict] = None
+    ) -> tuple[np.ndarray, Optional[dict]]:
         ext = Path(path).suffix.lower()
+        if ext == ".raw" and plain_raw_cfg is not None:
+            return cls._load_plain_raw(path, plain_raw_cfg)
         if ext in RAW_EXTS:
             return cls._load_raw(path, target_size=target_size)
-        return cls._load_regular(path)
+        return cls._load_regular(path, target_size=target_size)
+
+    @staticmethod
+    def _shift_with_zero(arr: np.ndarray, dy: int, dx: int) -> np.ndarray:
+        h, w = arr.shape
+        out = np.zeros_like(arr)
+        ys = slice(max(0, dy), min(h, h + dy))
+        yt = slice(max(0, -dy), min(h, h - dy))
+        xs = slice(max(0, dx), min(w, w + dx))
+        xt = slice(max(0, -dx), min(w, w - dx))
+        out[ys, xs] = arr[yt, xt]
+        return out
+
+    @classmethod
+    def _demosaic_bilinear(cls, raw: np.ndarray, pattern: str) -> np.ndarray:
+        rgb, cfa = cls._demosaic_bilinear_linear(raw, pattern)
+        lo = np.percentile(rgb, 1.0)
+        hi = np.percentile(rgb, 99.5)
+        if hi <= lo:
+            hi = lo + 1.0
+        rgb = np.clip((rgb - lo) / (hi - lo), 0.0, 1.0)
+        rgb = (rgb * 255.0).astype(np.uint8)
+        return rgb, cfa
+
+    @classmethod
+    def _demosaic_bilinear_linear(cls, raw: np.ndarray, pattern: str) -> tuple[np.ndarray, np.ndarray]:
+        pattern = pattern.upper()
+        idx = {"R": 0, "G": 1, "B": 2}
+        p = [[idx[pattern[0]], idx[pattern[1]]], [idx[pattern[2]], idx[pattern[3]]]]
+        h, w = raw.shape
+        cfa = np.zeros((h, w), dtype=np.uint8)
+        cfa[0::2, 0::2] = p[0][0]
+        cfa[0::2, 1::2] = p[0][1]
+        cfa[1::2, 0::2] = p[1][0]
+        cfa[1::2, 1::2] = p[1][1]
+
+        chans = []
+        rf = raw.astype(np.float32)
+        for ci in (0, 1, 2):
+            m = (cfa == ci).astype(np.float32)
+            v = rf * m
+            s = np.zeros_like(rf, dtype=np.float32)
+            c = np.zeros_like(rf, dtype=np.float32)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    s += cls._shift_with_zero(v, dy, dx)
+                    c += cls._shift_with_zero(m, dy, dx)
+            chans.append(s / np.maximum(c, 1e-6))
+
+        rgb = np.stack(chans, axis=-1)
+        return rgb, cfa
+
+    @staticmethod
+    def _unpack_mipi10(buf: np.ndarray, width: int, height: int) -> np.ndarray:
+        stride = (width * 10 + 7) // 8
+        need = stride * height
+        if buf.size < need:
+            raise ValueError("RAW10 数据长度不足")
+        buf = buf[:need].reshape(height, stride)
+        out = np.zeros((height, width), dtype=np.uint16)
+        groups = width // 4
+        for y in range(height):
+            row = buf[y]
+            for g in range(groups):
+                b0, b1, b2, b3, b4 = row[g * 5:g * 5 + 5]
+                x = g * 4
+                out[y, x + 0] = (int(b0) << 2) | (int(b4) & 0x03)
+                out[y, x + 1] = (int(b1) << 2) | ((int(b4) >> 2) & 0x03)
+                out[y, x + 2] = (int(b2) << 2) | ((int(b4) >> 4) & 0x03)
+                out[y, x + 3] = (int(b3) << 2) | ((int(b4) >> 6) & 0x03)
+        return out
+
+    @staticmethod
+    def _unpack_mipi12(buf: np.ndarray, width: int, height: int) -> np.ndarray:
+        stride = (width * 12 + 7) // 8
+        need = stride * height
+        if buf.size < need:
+            raise ValueError("RAW12 数据长度不足")
+        buf = buf[:need].reshape(height, stride)
+        out = np.zeros((height, width), dtype=np.uint16)
+        pairs = width // 2
+        for y in range(height):
+            row = buf[y]
+            for p in range(pairs):
+                b0, b1, b2 = row[p * 3:p * 3 + 3]
+                x = p * 2
+                out[y, x + 0] = (int(b0) << 4) | (int(b2) & 0x0F)
+                out[y, x + 1] = (int(b1) << 4) | ((int(b2) >> 4) & 0x0F)
+        return out
+
+    @classmethod
+    def _load_plain_raw(cls, path: str, cfg: dict) -> tuple[np.ndarray, Optional[dict]]:
+        w = int(cfg["width"])
+        h = int(cfg["height"])
+        bit = int(cfg["bit"])
+        pattern = str(cfg["pattern"]).upper()
+        packing = str(cfg["packing"]).lower()
+        if pattern not in {"RGGB", "BGGR", "GRBG", "GBRG"}:
+            raise ValueError("Bayer pattern 仅支持 RGGB/BGGR/GRBG/GBRG")
+
+        buf = np.fromfile(path, dtype=np.uint8)
+        if packing == "mipi10":
+            raw = cls._unpack_mipi10(buf, w, h)
+        elif packing == "mipi12":
+            raw = cls._unpack_mipi12(buf, w, h)
+        elif packing == "u8":
+            need = w * h
+            if buf.size < need:
+                raise ValueError("u8 RAW 数据长度不足")
+            raw = buf[:need].reshape(h, w).astype(np.uint16)
+        else:  # u16 / default
+            u16 = np.fromfile(path, dtype="<u2")
+            need = w * h
+            if u16.size < need:
+                raise ValueError("u16 RAW 数据长度不足")
+            raw = u16[:need].reshape(h, w)
+
+        mask = (1 << bit) - 1 if 1 <= bit <= 16 else 0xFFFF
+        raw = (raw & mask).astype(np.uint16)
+        _linear_rgb, cfa = cls._demosaic_bilinear_linear(raw, pattern)
+        white_level = int(mask)
+        rgb = render_plain_raw_with_matrix(
+            raw,
+            pattern=pattern,
+            black_level=0,
+            white_level=white_level,
+            exposure_gain=1.0,
+            wb_enabled=False,
+            wb=(1.0, 1.0, 1.0),
+            bit=bit,
+        )
+        raw_info = {
+            "raw": raw,
+            "cfa": cfa,
+            "desc": "RGB",
+            "bit": bit,
+            "black_level": 0,
+            "white_level": white_level,
+            "pattern": pattern,
+            "plain_raw": True,
+        }
+        return np.ascontiguousarray(rgb), raw_info
 
     @classmethod
     def _load_raw(cls, path: str, target_size: Optional[tuple[int, int]] = None) -> tuple[np.ndarray, Optional[dict]]:
@@ -327,13 +784,57 @@ class ShotwellRawDecoder:
                     desc = desc.decode("ascii", errors="ignore")
                 except Exception:
                     desc = "RGBG"
-            raw_info = {"raw": raw_visible, "cfa": cfa_visible, "desc": str(desc)}
+            wl = getattr(raw, "white_level", None)
+            bit = int(np.ceil(np.log2(max(2, int(wl) + 1)))) if wl is not None else 16
+            bit = max(1, min(16, bit))
+            raw_info = {"raw": raw_visible, "cfa": cfa_visible, "desc": str(desc), "bit": bit}
 
         return np.ascontiguousarray(rgb.astype(np.uint8, copy=False)), raw_info
 
     @staticmethod
-    def _load_regular(path: str) -> tuple[np.ndarray, Optional[dict]]:
-        arr = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
+    def _load_regular(
+        path: str, target_size: Optional[tuple[int, int]] = None
+    ) -> tuple[np.ndarray, Optional[dict]]:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        full_size = reader.size()
+
+        if target_size is not None and full_size.isValid():
+            target_w = max(1, int(target_size[0]))
+            target_h = max(1, int(target_size[1]))
+            scaled_w, scaled_h = fit_dimensions(
+                max(1, full_size.width()),
+                max(1, full_size.height()),
+                target_w,
+                target_h,
+            )
+
+            if (full_size.width() > 9999 or full_size.height() > 9999) and (scaled_w < 100 or scaled_h < 100):
+                prefetch_w, prefetch_h = fit_dimensions(
+                    max(1, full_size.width()),
+                    max(1, full_size.height()),
+                    1000,
+                    1000,
+                )
+                reader.setScaledSize(QSize(prefetch_w, prefetch_h))
+                prefetched = reader.read()
+                if not prefetched.isNull():
+                    downsampled = prefetched.scaled(
+                        scaled_w, scaled_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+                    )
+                    return qimage_to_rgb_array(downsampled), None
+                reader = QImageReader(path)
+                reader.setAutoTransform(True)
+
+            if (scaled_w, scaled_h) != (full_size.width(), full_size.height()):
+                reader.setScaledSize(QSize(scaled_w, scaled_h))
+
+        qimg = reader.read()
+        if not qimg.isNull():
+            return qimage_to_rgb_array(qimg), None
+
+        with Image.open(path) as img:
+            arr = np.array(img.convert("RGB"), dtype=np.uint8)
         return np.ascontiguousarray(arr), None
 
 
@@ -606,9 +1107,17 @@ class Pane(QWidget):
         self.p = QLabel("未加载")
         self.p.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.v = SyncView()
+        self.source_path: Optional[str] = None
         self.base_rgb: Optional[np.ndarray] = None
         self.raw_info: Optional[dict] = None
         self.params = dict(DEFAULT_ADJUSTMENTS)
+        self.raw_channel_mode = "ALL"
+        self.raw_display_bits = 16
+        self.raw_black_level = 0
+        self.raw_white_level = (1 << 16) - 1
+        self.raw_exposure_gain = 1.0
+        self.raw_wb_enabled = False
+        self.raw_wb = (1.0, 1.0, 1.0)
         self.render_request_id = 0
 
         lay = QVBoxLayout(self)
@@ -621,16 +1130,64 @@ class Pane(QWidget):
         self.v.file_dropped.connect(self.file_dropped)
 
     def set_baseline(self, path: str, rgb: np.ndarray, raw_info: Optional[dict] = None):
+        self.source_path = path
         self.p.setText(path)
         self.base_rgb = np.ascontiguousarray(rgb.astype(np.uint8, copy=False))
         self.raw_info = raw_info
+        if self.raw_info is not None:
+            self.raw_display_bits = int(self.raw_info.get("bit", 16))
+            maxv = (1 << max(1, min(16, int(self.raw_display_bits)))) - 1
+            self.raw_black_level = int(self.raw_info.get("black_level", 0))
+            self.raw_white_level = int(self.raw_info.get("white_level", maxv))
+            self.raw_exposure_gain = 1.0
+            self.raw_wb_enabled = False
+            self.raw_wb = (1.0, 1.0, 1.0)
         self.params = dict(DEFAULT_ADJUSTMENTS)
         self.render_current(reset_view=True)
+
+    def supports_raw_controls(self) -> bool:
+        if self.raw_info is None:
+            return False
+        if not self.source_path:
+            return False
+        return Path(self.source_path).suffix.lower() != ".dng"
+
+    def raw_controls_unavailable_reason(self) -> str:
+        if self.supports_raw_controls():
+            return ""
+        if not self.source_path:
+            return "未加载 RAW 图"
+        ext = Path(self.source_path).suffix.lower()
+        if ext:
+            return f"{ext[1:].upper()} 不支持 RAW 调参"
+        return "当前图像不支持 RAW 调参"
 
     def render_current(self, reset_view: bool = False):
         if self.base_rgb is None:
             return
-        out = apply_adjustments(self.base_rgb, self.params)
+        if self.raw_info is not None and self.raw_channel_mode != "ALL":
+            raw = self.raw_info.get("raw")
+            cfa = self.raw_info.get("cfa")
+            desc = self.raw_info.get("desc", "RGBG")
+            if raw is not None and cfa is not None:
+                out = raw_channel_to_display_rgb(
+                    raw, cfa, desc, self.raw_channel_mode, self.raw_display_bits,
+                    self.raw_black_level, self.raw_white_level, self.raw_exposure_gain
+                )
+            else:
+                out = apply_adjustments(self.base_rgb, self.params)
+        else:
+            src = render_raw_all_source_rgb(
+                self.base_rgb,
+                self.raw_info,
+                self.raw_display_bits,
+                self.raw_black_level,
+                self.raw_white_level,
+                self.raw_exposure_gain,
+                self.raw_wb_enabled,
+                self.raw_wb,
+            )
+            out = apply_adjustments(src, self.params)
         self.show_rendered_rgb(out, reset_view=reset_view)
 
     def show_rendered_rgb(self, out: np.ndarray, reset_view: bool = False):
@@ -647,7 +1204,7 @@ class Pane(QWidget):
         else:
             self.v.apply_state(prev)
 
-    def sample_raw_at(self, x: int, y: int) -> Optional[dict]:
+    def sample_raw_at(self, x: int, y: int, disp_w: Optional[int] = None, disp_h: Optional[int] = None) -> Optional[dict]:
         if self.raw_info is None or self.base_rgb is None:
             return None
         raw = self.raw_info.get("raw")
@@ -655,7 +1212,10 @@ class Pane(QWidget):
         desc = self.raw_info.get("desc", "RGBG")
         if raw is None or cfa is None:
             return None
-        h_rgb, w_rgb = self.base_rgb.shape[:2]
+        if disp_w is None or disp_h is None:
+            h_rgb, w_rgb = self.base_rgb.shape[:2]
+        else:
+            w_rgb, h_rgb = int(disp_w), int(disp_h)
         h_raw, w_raw = raw.shape[:2]
         if w_rgb <= 0 or h_rgb <= 0 or w_raw <= 0 or h_raw <= 0:
             return None
@@ -667,6 +1227,60 @@ class Pane(QWidget):
         ci = int(cfa[ry, rx])
         ch = desc[ci] if 0 <= ci < len(desc) else f"C{ci}"
         return {"x": rx, "y": ry, "value": raw_val, "channel": ch, "dtype": str(raw.dtype)}
+
+    def sample_raw_mode_at(
+        self, x: int, y: int, mode: str, disp_w: Optional[int] = None, disp_h: Optional[int] = None
+    ) -> Optional[dict]:
+        mode = (mode or "ALL").upper()
+        if mode == "ALL":
+            return self.sample_raw_at(x, y, disp_w, disp_h)
+        if self.raw_info is None:
+            return None
+        raw = self.raw_info.get("raw")
+        cfa = self.raw_info.get("cfa")
+        desc = self.raw_info.get("desc", "RGBG")
+        if raw is None or cfa is None:
+            return None
+
+        if disp_w is None or disp_h is None:
+            h_disp, w_disp = self.base_rgb.shape[:2]
+        else:
+            w_disp, h_disp = int(disp_w), int(disp_h)
+        h_raw, w_raw = raw.shape[:2]
+        if w_disp <= 0 or h_disp <= 0 or w_raw <= 0 or h_raw <= 0:
+            return None
+        rx = int(round(x * (w_raw - 1) / max(1, w_disp - 1)))
+        ry = int(round(y * (h_raw - 1) / max(1, h_disp - 1)))
+        rx = max(0, min(w_raw - 1, rx))
+        ry = max(0, min(h_raw - 1, ry))
+
+        mask = np.zeros((h_raw, w_raw), dtype=bool)
+        if mode in ("R", "B"):
+            for i in range(min(len(desc), 8)):
+                if desc[i].upper() == mode:
+                    mask |= (cfa == i)
+        elif mode in ("G1", "G2"):
+            gmask = np.zeros((h_raw, w_raw), dtype=bool)
+            for i in range(min(len(desc), 8)):
+                if desc[i].upper() == "G":
+                    gmask |= (cfa == i)
+            yy = np.indices((h_raw, w_raw))[0]
+            mask = gmask & ((yy % 2 == 0) if mode == "G1" else (yy % 2 == 1))
+        else:
+            return self.sample_raw_at(x, y, disp_w, disp_h)
+
+        if not np.any(mask):
+            return None
+
+        if not mask[ry, rx]:
+            pts = np.argwhere(mask)
+            if pts.size == 0:
+                return None
+            d2 = (pts[:, 0] - ry) * (pts[:, 0] - ry) + (pts[:, 1] - rx) * (pts[:, 1] - rx)
+            k = int(np.argmin(d2))
+            ry, rx = int(pts[k, 0]), int(pts[k, 1])
+
+        return {"x": rx, "y": ry, "value": int(raw[ry, rx]), "channel": mode, "dtype": str(raw.dtype)}
 
     def sample_render_at(self, x: int, y: int) -> Optional[dict]:
         if self.base_rgb is None:
@@ -772,6 +1386,190 @@ class AdjustPanel(QGroupBox):
         self.changed.emit(self.values())
 
 
+class RawAdjustPanel(QGroupBox):
+    changed = pyqtSignal(str, dict)  # pane_id, {channel, bit, black, white, exposure, wb_enabled, wb_r, wb_g, wb_b}
+
+    def __init__(self, parent=None):
+        super().__init__("RAW 调参", parent)
+        self._widgets = {}
+        self._tabs = {}
+        self._hints = {}
+        self.setStyleSheet("""
+            QWidget { color: #cccccc; background: #2d2d2d; }
+            QComboBox, QSpinBox, QTabBar::tab {
+                color: #cccccc;
+                background-color: #3a3a3a;
+                border: 1px solid #4a4a4a;
+                border-radius: 4px;
+                padding: 2px 6px;
+            }
+            QTabWidget::pane {
+                border: none;
+                background-color: #2d2d2d;
+            }
+            QTabBar::tab:selected {
+                background-color: #2d2d2d;
+                border-bottom: 2px solid #4a6a9a;
+            }
+        """)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_tab("left"), "左图")
+        tabs.addTab(self._build_tab("right"), "右图")
+        lay = QVBoxLayout(self)
+        lay.addWidget(tabs)
+
+    def _build_tab(self, pane_id: str) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        hint = QLabel("")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#999999; padding:2px 0 6px 0;")
+        hint.setVisible(False)
+        lay.addWidget(hint)
+        form_wrap = QWidget()
+        form = QFormLayout(form_wrap)
+        ch = QComboBox()
+        ch.addItems(["ALL", "R", "G1", "G2", "B"])
+        bit = QSpinBox()
+        bit.setRange(1, 16)
+        bit.setValue(16)
+        black = QSpinBox(); black.setRange(0, 65535); black.setValue(0)
+        white = QSpinBox(); white.setRange(1, 65535); white.setValue(65535)
+        exp = QDoubleSpinBox(); exp.setRange(0.01, 32.0); exp.setSingleStep(0.05); exp.setValue(1.0)
+        wb_en = QCheckBox("启用 WB")
+        wb_r = QDoubleSpinBox(); wb_r.setRange(0.1, 8.0); wb_r.setSingleStep(0.01); wb_r.setValue(1.0)
+        wb_g = QDoubleSpinBox(); wb_g.setRange(0.1, 8.0); wb_g.setSingleStep(0.01); wb_g.setValue(1.0)
+        wb_b = QDoubleSpinBox(); wb_b.setRange(0.1, 8.0); wb_b.setSingleStep(0.01); wb_b.setValue(1.0)
+        ch.currentTextChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        bit.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        black.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        white.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        exp.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        wb_en.toggled.connect(lambda _v, pid=pane_id: self._emit(pid))
+        wb_r.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        wb_g.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        wb_b.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        form.addRow("Bayer 通道", ch)
+        form.addRow("显示 Bit", bit)
+        form.addRow("Black Level", black)
+        form.addRow("White Level", white)
+        form.addRow("Exposure Gain", exp)
+        form.addRow("白平衡", wb_en)
+        form.addRow("WB R", wb_r)
+        form.addRow("WB G", wb_g)
+        form.addRow("WB B", wb_b)
+        lay.addWidget(form_wrap)
+        self._widgets[pane_id] = {
+            "channel": ch, "bit": bit, "black": black, "white": white, "exp": exp,
+            "wb_en": wb_en, "wb_r": wb_r, "wb_g": wb_g, "wb_b": wb_b
+        }
+        self._tabs[pane_id] = w
+        self._hints[pane_id] = hint
+        return w
+
+    def set_values(
+        self, pane_id: str, channel: str, bit: int,
+        black: int = 0, white: int = 65535, exposure: float = 1.0,
+        wb_enabled: bool = False, wb_r: float = 1.0, wb_g: float = 1.0, wb_b: float = 1.0
+    ):
+        ws = self._widgets[pane_id]
+        ws["channel"].setCurrentText(channel)
+        ws["bit"].setValue(int(bit))
+        ws["black"].setValue(int(max(0, min(65535, int(black)))))
+        ws["white"].setValue(int(max(1, min(65535, int(white)))))
+        ws["exp"].setValue(float(exposure))
+        ws["wb_en"].setChecked(bool(wb_enabled))
+        ws["wb_r"].setValue(float(wb_r))
+        ws["wb_g"].setValue(float(wb_g))
+        ws["wb_b"].setValue(float(wb_b))
+
+    def _emit(self, pane_id: str):
+        ws = self._widgets[pane_id]
+        self.changed.emit(
+            pane_id,
+            {
+                "channel": ws["channel"].currentText(),
+                "bit": int(ws["bit"].value()),
+                "black": int(ws["black"].value()),
+                "white": int(ws["white"].value()),
+                "exposure": float(ws["exp"].value()),
+                "wb_enabled": bool(ws["wb_en"].isChecked()),
+                "wb_r": float(ws["wb_r"].value()),
+                "wb_g": float(ws["wb_g"].value()),
+                "wb_b": float(ws["wb_b"].value()),
+            }
+        )
+
+    def set_pane_enabled(self, pane_id: str, enabled: bool, reason: str = ""):
+        tab = self._tabs.get(pane_id)
+        if tab is not None:
+            tab.setEnabled(bool(enabled))
+        hint = self._hints.get(pane_id)
+        if hint is not None:
+            hint.setText(reason)
+            hint.setVisible(bool(reason))
+
+
+class RawLoadConfigDialog(QDialog):
+    def __init__(self, parent=None, default_text: str = "4096,3072,10,RGGB,u16", filename: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("RAW 加载配置")
+        self.resize(380, 260)
+        self.setStyleSheet("""
+            QDialog, QWidget { color: #000000; background: #ffffff; }
+            QComboBox, QSpinBox, QPushButton, QLabel {
+                color: #000000; background: #ffffff;
+            }
+        """)
+
+        parts = [x.strip() for x in default_text.split(",")]
+        w0, h0, b0, p0, k0 = 4096, 3072, 10, "RGGB", "u16"
+        if len(parts) == 5:
+            try:
+                w0, h0, b0 = int(parts[0]), int(parts[1]), int(parts[2])
+                p0, k0 = parts[3].upper(), parts[4].lower()
+            except Exception:
+                pass
+
+        form = QFormLayout()
+        tip = QLabel(f"文件: {filename}")
+        form.addRow("文件", tip)
+
+        self.sp_w = QSpinBox(); self.sp_w.setRange(1, 20000); self.sp_w.setValue(w0)
+        self.sp_h = QSpinBox(); self.sp_h.setRange(1, 20000); self.sp_h.setValue(h0)
+        self.sp_b = QSpinBox(); self.sp_b.setRange(1, 16); self.sp_b.setValue(max(1, min(16, b0)))
+        self.cb_p = QComboBox(); self.cb_p.addItems(["RGGB", "BGGR", "GRBG", "GBRG"]); self.cb_p.setCurrentText(p0 if p0 in {"RGGB","BGGR","GRBG","GBRG"} else "RGGB")
+        self.cb_k = QComboBox(); self.cb_k.addItems(["u16", "u8", "mipi10", "mipi12"]); self.cb_k.setCurrentText(k0 if k0 in {"u16","u8","mipi10","mipi12"} else "u16")
+
+        form.addRow("Width", self.sp_w)
+        form.addRow("Height", self.sp_h)
+        form.addRow("Bit", self.sp_b)
+        form.addRow("Bayer", self.cb_p)
+        form.addRow("Packing", self.cb_k)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(buttons)
+
+    def get_cfg(self) -> dict:
+        return {
+            "width": int(self.sp_w.value()),
+            "height": int(self.sp_h.value()),
+            "bit": int(self.sp_b.value()),
+            "pattern": self.cb_p.currentText().upper(),
+            "packing": self.cb_k.currentText().lower(),
+        }
+
+    def get_cfg_text(self) -> str:
+        c = self.get_cfg()
+        return f"{c['width']},{c['height']},{c['bit']},{c['pattern']},{c['packing']}"
+
+
 class Window(QMainWindow):
     load_done = pyqtSignal(object, object, object, object)   # pane, path, rgb, raw_info_or_error
     adjust_done = pyqtSignal(object, int, object)            # pane, request_id, rgb
@@ -810,6 +1608,7 @@ class Window(QMainWindow):
         self.btn_peek = QPushButton("←")
         self.btn_probe = QPushButton("Locate·关")
         self.btn_probe_src = QPushButton("Value:显示(渲染)")
+        self.btn_bayer = QPushButton("通道·--")
         self.btn_11 = QPushButton("100%")
         self.btn_fit = QPushButton("Fit")
         self.btn_link = QPushButton("同步·开")
@@ -821,6 +1620,9 @@ class Window(QMainWindow):
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self._adjust_timers = {}
         self._adjust_dragging = {}
+        self._plain_raw_cfg_text = "4096,3072,10,RGGB,u16"
+        self.raw_adj_panel = RawAdjustPanel(self)
+        self.raw_adj_panel.changed.connect(self._on_raw_adjust_changed)
 
         self.btn_l.clicked.connect(lambda: self._load_one(self.left))
         self.btn_r.clicked.connect(lambda: self._load_one(self.right))
@@ -830,6 +1632,7 @@ class Window(QMainWindow):
         self.btn_peek.released.connect(self._peek_right_on_left_end)
         self.btn_probe.clicked.connect(self._toggle_probe_mode)
         self.btn_probe_src.clicked.connect(self._toggle_probe_source)
+        self.btn_bayer.clicked.connect(self._cycle_bayer_mode)
         self.btn_11.clicked.connect(self._one_to_one)
         self.btn_fit.clicked.connect(self._fit_all)
         self.btn_link.clicked.connect(self._toggle_link)
@@ -858,6 +1661,7 @@ class Window(QMainWindow):
         lay_probe = QHBoxLayout(grp_probe)
         lay_probe.addWidget(self.btn_probe)
         lay_probe.addWidget(self.btn_probe_src)
+        lay_probe.addWidget(self.btn_bayer)
 
         grp_zoom = QGroupBox("视图")
         lay_zoom = QHBoxLayout(grp_zoom)
@@ -880,6 +1684,7 @@ class Window(QMainWindow):
         adj_col.setContentsMargins(0, 0, 0, 0)
         adj_col.addWidget(self.left_adj)
         adj_col.addWidget(self.right_adj)
+        adj_col.addWidget(self.raw_adj_panel)
         mid.addWidget(self.adj_container)
 
         root = QWidget()
@@ -890,6 +1695,9 @@ class Window(QMainWindow):
         self.setCentralWidget(root)
         self._update_adjust_panel_visibility()
         self._beautify_controls()
+        self.raw_adj_panel.set_values("left", "ALL", 16, 0, 65535, 1.0, False, 1.0, 1.0, 1.0)
+        self.raw_adj_panel.set_values("right", "ALL", 16, 0, 65535, 1.0, False, 1.0, 1.0, 1.0)
+        self._refresh_raw_controls_ui()
 
     def _apply_modern_theme(self):
         self.setStyleSheet("""
@@ -922,7 +1730,8 @@ class Window(QMainWindow):
     def _beautify_controls(self):
         buttons = [
             self.btn_l, self.btn_r, self.btn_mode, self.btn_adjust,
-            self.btn_peek, self.btn_probe, self.btn_probe_src, self.btn_11, self.btn_fit, self.btn_link
+            self.btn_peek, self.btn_probe, self.btn_probe_src, self.btn_bayer,
+            self.btn_11, self.btn_fit, self.btn_link
         ]
         for b in buttons:
             b.setMinimumHeight(30)
@@ -937,6 +1746,26 @@ class Window(QMainWindow):
         self.btn_adjust.setStyleSheet(_btn_style_checked() if self._adjust_visible else _btn_style())
         self.btn_probe.setStyleSheet(_btn_style_checked() if self._probe_enabled else _btn_style())
         self.btn_link.setStyleSheet(_btn_style_checked() if self._link else _btn_style())
+
+    def _primary_raw_pane(self) -> Optional[Pane]:
+        if self.left.supports_raw_controls():
+            return self.left
+        if self.right.supports_raw_controls():
+            return self.right
+        return None
+
+    def _refresh_raw_controls_ui(self):
+        left_enabled = self.left.supports_raw_controls()
+        right_enabled = self.right.supports_raw_controls()
+        self.raw_adj_panel.set_pane_enabled("left", left_enabled, self.left.raw_controls_unavailable_reason())
+        self.raw_adj_panel.set_pane_enabled("right", right_enabled, self.right.raw_controls_unavailable_reason())
+
+        primary = self._primary_raw_pane()
+        self.btn_bayer.setEnabled(primary is not None)
+        if primary is None:
+            self.btn_bayer.setText("通道·--")
+        else:
+            self.btn_bayer.setText(f"通道·{primary.raw_channel_mode}")
 
     def _toggle_mode(self):
         self._single_view = not self._single_view
@@ -988,6 +1817,55 @@ class Window(QMainWindow):
         self._probe_source = "raw" if self._probe_source == "render" else "render"
         self.btn_probe_src.setText(f"{'Value:RAW' if self._probe_source == 'raw' else 'Value:显示(渲染)'}")
 
+    def _on_raw_adjust_changed(self, pane_id: str, params: dict):
+        pane = self.left if pane_id == "left" else self.right
+        if not pane.supports_raw_controls():
+            return
+        pane.raw_channel_mode = str(params.get("channel", "ALL")).upper()
+        pane.raw_display_bits = int(params.get("bit", 16))
+        pane.raw_black_level = int(params.get("black", 0))
+        pane.raw_white_level = int(params.get("white", (1 << pane.raw_display_bits) - 1))
+        pane.raw_exposure_gain = float(params.get("exposure", 1.0))
+        pane.raw_wb_enabled = bool(params.get("wb_enabled", False))
+        pane.raw_wb = (
+            float(params.get("wb_r", 1.0)),
+            float(params.get("wb_g", 1.0)),
+            float(params.get("wb_b", 1.0)),
+        )
+        self._refresh_raw_controls_ui()
+        if pane.base_rgb is not None:
+            if pane.raw_channel_mode == "ALL":
+                self._submit_adjust_render(pane, preview=False)
+            else:
+                pane.render_current(reset_view=False)
+
+    def _cycle_bayer_mode(self):
+        panes = [pane for pane in (self.left, self.right) if pane.supports_raw_controls()]
+        if not panes:
+            self._refresh_raw_controls_ui()
+            return
+        modes = ["ALL", "R", "G1", "G2", "B"]
+        cur = panes[0].raw_channel_mode
+        nxt = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else "ALL"
+        for pane in panes:
+            pane.raw_channel_mode = nxt
+        if self.left.supports_raw_controls():
+            self.raw_adj_panel.set_values(
+                "left", self.left.raw_channel_mode, self.left.raw_display_bits,
+                self.left.raw_black_level, self.left.raw_white_level, self.left.raw_exposure_gain,
+                self.left.raw_wb_enabled, self.left.raw_wb[0], self.left.raw_wb[1], self.left.raw_wb[2]
+            )
+        if self.right.supports_raw_controls():
+            self.raw_adj_panel.set_values(
+                "right", self.right.raw_channel_mode, self.right.raw_display_bits,
+                self.right.raw_black_level, self.right.raw_white_level, self.right.raw_exposure_gain,
+                self.right.raw_wb_enabled, self.right.raw_wb[0], self.right.raw_wb[1], self.right.raw_wb[2]
+            )
+        self._refresh_raw_controls_ui()
+        for pane in panes:
+            if pane.base_rgb is not None:
+                pane.render_current(reset_view=False)
+
     def _on_pixel_picked(self, pane_name: str, pane: Pane, p: dict):
         if not self._probe_enabled:
             return
@@ -1018,16 +1896,48 @@ class Window(QMainWindow):
                     f"左图 渲染后(x={left_render['x']}, y={left_render['y']}) "
                     f"R={left_render['r']} G={left_render['g']} B={left_render['b']} Gray={left_render['gray']}"
                 )
+                if self.left.raw_info is not None:
+                    if self.left.raw_channel_mode == "ALL":
+                        lr = self.left.sample_raw_at(
+                            left_render["x"], left_render["y"], left_render["w"], left_render["h"]
+                        )
+                    else:
+                        lr = self.left.sample_raw_mode_at(
+                            left_render["x"], left_render["y"], self.left.raw_channel_mode, left_render["w"], left_render["h"]
+                        )
+                    if lr is not None:
+                        left_txt += f" [RAW域:{lr['channel']}={lr['value']}]"
             if right_render is not None:
                 right_txt = (
                     f"右图 渲染后(x={right_render['x']}, y={right_render['y']}) "
                     f"R={right_render['r']} G={right_render['g']} B={right_render['b']} Gray={right_render['gray']}"
                 )
+                if self.right.raw_info is not None:
+                    if self.right.raw_channel_mode == "ALL":
+                        rr = self.right.sample_raw_at(
+                            right_render["x"], right_render["y"], right_render["w"], right_render["h"]
+                        )
+                    else:
+                        rr = self.right.sample_raw_mode_at(
+                            right_render["x"], right_render["y"], self.right.raw_channel_mode, right_render["w"], right_render["h"]
+                        )
+                    if rr is not None:
+                        right_txt += f" [RAW域:{rr['channel']}={rr['value']}]"
             self.pixel_info.setText(f"{left_txt} || {right_txt} | 类型: uint8")
             return
 
-        left_raw = self.left.sample_raw_at(left_render["x"], left_render["y"]) if left_render is not None else None
-        right_raw = self.right.sample_raw_at(right_render["x"], right_render["y"]) if right_render is not None else None
+        left_raw = (
+            self.left.sample_raw_mode_at(
+                left_render["x"], left_render["y"], self.left.raw_channel_mode, left_render["w"], left_render["h"]
+            )
+            if left_render is not None else None
+        )
+        right_raw = (
+            self.right.sample_raw_mode_at(
+                right_render["x"], right_render["y"], self.right.raw_channel_mode, right_render["w"], right_render["h"]
+            )
+            if right_render is not None else None
+        )
         left_txt = "左图 RAW原始: 不可用"
         right_txt = "右图 RAW原始: 不可用"
         if left_raw is not None:
@@ -1044,6 +1954,9 @@ class Window(QMainWindow):
 
     def _on_adjust(self, pane: Pane, params: dict):
         pane.params = dict(params)
+        if pane.raw_channel_mode != "ALL":
+            pane.render_current(reset_view=False)
+            return
         dragging = self._adjust_dragging.get(pane, False)
         self._schedule_adjust_render(pane, debounce_ms=25 if dragging else 40, preview=dragging)
 
@@ -1064,15 +1977,32 @@ class Window(QMainWindow):
         timer.start(debounce_ms)
 
     def _submit_adjust_render(self, pane: Pane, preview: bool = False):
-        if pane.base_rgb is None:
+        if pane.base_rgb is None or pane.raw_channel_mode != "ALL":
             return
         pane.render_request_id += 1
         req_id = pane.render_request_id
         base = pane.base_rgb
+        raw_info = pane.raw_info
         params = dict(pane.params)
+        raw_display_bits = int(pane.raw_display_bits)
+        raw_black_level = int(pane.raw_black_level)
+        raw_white_level = int(pane.raw_white_level)
+        raw_exposure_gain = float(pane.raw_exposure_gain)
+        raw_wb_enabled = bool(pane.raw_wb_enabled)
+        raw_wb = tuple(float(v) for v in pane.raw_wb)
 
         def task():
-            return fast_preview_adjust(base, params) if preview else apply_adjustments(base, params)
+            src = render_raw_all_source_rgb(
+                base,
+                raw_info,
+                raw_display_bits,
+                raw_black_level,
+                raw_white_level,
+                raw_exposure_gain,
+                raw_wb_enabled,
+                raw_wb,
+            )
+            return fast_preview_adjust(src, params) if preview else apply_adjustments(src, params)
 
         fut = self._executor.submit(task)
 
@@ -1086,7 +2016,7 @@ class Window(QMainWindow):
         fut.add_done_callback(done_cb)
 
     def _on_adjust_done(self, pane: Pane, request_id: int, out: np.ndarray):
-        if request_id != pane.render_request_id:
+        if request_id != pane.render_request_id or pane.raw_channel_mode != "ALL":
             return
         pane.show_rendered_rgb(out, reset_view=False)
 
@@ -1110,9 +2040,15 @@ class Window(QMainWindow):
             self._sync_lock = False
 
     def _pick_file(self) -> Optional[str]:
+        raw_patterns = " ".join(
+            sorted({f"*{e}" for e in RAW_EXTS} | {f"*{e.upper()}" for e in RAW_EXTS})
+        )
+        img_patterns = "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"
         filt = (
-            "Images (*.dng *.nef *.cr2 *.cr3 *.arw *.raf *.rw2 *.orf *.pef *.srw *.raw "
-            "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp)"
+            f"RAW/Images ({raw_patterns} {img_patterns});;"
+            f"RAW Only ({raw_patterns});;"
+            f"Images Only ({img_patterns});;"
+            "All Files (*)"
         )
         dlg = QFileDialog(self, "选择图片")
         dlg.setFileMode(QFileDialog.ExistingFile)
@@ -1143,13 +2079,40 @@ class Window(QMainWindow):
             return
         self._load_path_into_pane(pane, path)
 
+    def _ask_plain_raw_cfg(self, path: str) -> Optional[dict]:
+        dlg = RawLoadConfigDialog(self, default_text=self._plain_raw_cfg_text, filename=os.path.basename(path))
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        try:
+            cfg = dlg.get_cfg()
+            self._plain_raw_cfg_text = dlg.get_cfg_text()
+            return cfg
+        except Exception:
+            self.msg.setText("RAW 配置解析失败")
+            return None
+
+    def _raw_can_use_shotwell_pipeline(self, path: str) -> bool:
+        """判断 .RAW 是否可被 rawpy/libraw 直接识别（可走 Shotwell-like 管线）。"""
+        try:
+            with rawpy.imread(path):
+                return True
+        except Exception:
+            return False
+
     def _load_path_into_pane(self, pane: Pane, path: str):
         self.msg.setText(f"加载中: {os.path.basename(path)} ...")
         vp = pane.v.viewport().size()
         target = (vp.width(), vp.height())
+        plain_raw_cfg = None
+        if Path(path).suffix.lower() == ".raw":
+            # 优先尝试 Shotwell-like (LibRaw) 解码；仅在不支持时回退到裸 RAW 配置
+            if not self._raw_can_use_shotwell_pipeline(path):
+                plain_raw_cfg = self._ask_plain_raw_cfg(path)
+                if plain_raw_cfg is None:
+                    return
 
         def task():
-            return ShotwellRawDecoder.load(path, target_size=target)
+            return ShotwellRawDecoder.load(path, target_size=target, plain_raw_cfg=plain_raw_cfg)
 
         fut = self._executor.submit(task)
 
@@ -1220,9 +2183,22 @@ class Window(QMainWindow):
             return
         pane.set_baseline(path, rgb, raw_or_err)
         if pane is self.left:
+            self.raw_adj_panel.set_values(
+                "left", self.left.raw_channel_mode, self.left.raw_display_bits,
+                self.left.raw_black_level, self.left.raw_white_level, self.left.raw_exposure_gain,
+                self.left.raw_wb_enabled, self.left.raw_wb[0], self.left.raw_wb[1], self.left.raw_wb[2]
+            )
+        else:
+            self.raw_adj_panel.set_values(
+                "right", self.right.raw_channel_mode, self.right.raw_display_bits,
+                self.right.raw_black_level, self.right.raw_white_level, self.right.raw_exposure_gain,
+                self.right.raw_wb_enabled, self.right.raw_wb[0], self.right.raw_wb[1], self.right.raw_wb[2]
+            )
+        if pane is self.left:
             self.left_adj.set_values(dict(DEFAULT_ADJUSTMENTS))
         else:
             self.right_adj.set_values(dict(DEFAULT_ADJUSTMENTS))
+        self._refresh_raw_controls_ui()
         self.msg.setText(f"已加载: {os.path.basename(path)}")
 
     def _one_to_one(self):
@@ -1261,6 +2237,7 @@ def main():
         except Exception as e:
             w.msg.setText(f"右图加载失败: {e}")
 
+    w._refresh_raw_controls_ui()
     w.show()
     sys.exit(app.exec_())
 
