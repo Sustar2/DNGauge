@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=DNGauge
+Comment=DNG RAW JPG PNG compare viewer
+Exec=__APPDIR__/DNGauge
+Path=__APPDIR__
+Icon=__APPDIR__/DNGauge.png
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+StartupNotify=true

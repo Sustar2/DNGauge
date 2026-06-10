@@ -1,4 +1,4 @@
-# DNG_COMPARE
+# DNGauge
 
 PyQt5 desktop tool for side-by-side comparison of `DNG / RAW / JPG / PNG / TIFF` images.
 
@@ -16,6 +16,17 @@ Current focus:
 
 ```text
 DNG_COMPARE/
+├── packaging/            # Build scripts, icons, spec, portable assets
+│   ├── DNGauge.png
+│   ├── DNGauge.ico
+│   ├── DNGauge.spec
+│   ├── build_linux.sh
+│   ├── build_windows.bat
+│   ├── package_portable_linux.sh
+│   └── portable_assets/
+├── release/              # Generated portable output (ignored)
+├── build/                # PyInstaller build cache (ignored)
+├── dist/                 # Generated executable output (ignored)
 ├── shotwell_compare.py   # Main program
 ├── requirements.txt      # Python dependencies
 ├── run.sh                # Linux launcher for conda env dng_compare
@@ -91,7 +102,86 @@ python shotwell_compare.py left.dng right.jpg
 
 ---
 
-## 4. Supported Inputs
+## 4. Packaging
+
+### Linux executable
+
+Build:
+
+```bash
+chmod +x packaging/build_linux.sh
+./packaging/build_linux.sh
+```
+
+Output:
+
+```text
+dist/DNGauge
+```
+
+This is a PyInstaller single-file executable.
+
+Branding:
+- window icon uses `DNGauge.png`
+- desktop launcher icon uses `DNGauge.png`
+
+### Windows executable
+
+Build on Windows:
+
+```cmd
+packaging\build_windows.bat
+```
+
+Output:
+
+```text
+dist\DNGauge.exe
+```
+
+Branding:
+- executable icon uses `DNGauge.ico`
+- taskbar / app identity is set to `DNGauge`
+
+### GitHub Actions
+
+This repo also includes a cross-platform build workflow:
+
+```text
+.github/workflows/build-packages.yml
+```
+
+It builds:
+- Linux artifact: `DNGauge-linux`
+- Windows artifact: `DNGauge-windows`
+
+### Linux runtime note
+
+Some Linux desktops may still require system Qt/XCB libraries such as:
+
+```text
+libxcb-xinerama0
+```
+
+### Portable release layout
+
+The generated Linux portable folder keeps only the files needed by end users:
+
+```text
+release/DNGauge-linux-portable/
+├── DNGauge                  # Main executable
+├── DNGauge.desktop          # Ready-to-use launcher with icon
+├── DNGauge.png              # Icon used by launcher/window
+├── DNGauge.desktop.template # Template for re-installing launcher
+├── install_desktop_launcher.sh
+├── README_RUN.txt
+├── README_RUN_CN.txt
+└── README_RUN_EN.txt
+```
+
+---
+
+## 5. Supported Inputs
 
 ### Standard images
 - `jpg`
@@ -124,7 +214,7 @@ Default dialog value:
 
 ---
 
-## 5. Display Pipeline
+## 6. Display Pipeline
 
 ### Camera RAW / DNG
 - decoded by `rawpy`
@@ -154,7 +244,7 @@ Important:
 
 ---
 
-## 6. Main UI
+## 7. Main UI
 
 Top toolbar groups:
 
@@ -174,7 +264,7 @@ Bottom status bar:
 
 ---
 
-## 7. Comparison Behavior
+## 8. Comparison Behavior
 
 ### Dual image mode
 - left and right panes shown together
@@ -193,7 +283,7 @@ Bottom status bar:
 
 ---
 
-## 8. RAW Display and RAW Parameters
+## 9. RAW Display and RAW Parameters
 
 There are two RAW-related controls:
 
@@ -229,7 +319,7 @@ If left is plain `.RAW` and right is `DNG`:
 
 ---
 
-## 9. LOCATE / Data Sampling
+## 10. LOCATE / Data Sampling
 
 ### Rendered-value mode
 Button:
@@ -264,7 +354,7 @@ For channel mode:
 
 ---
 
-## 10. Large Image Notes
+## 11. Large Image Notes
 
 ### Why Shotwell opened some large JPG/PNG faster
 
@@ -283,7 +373,7 @@ Very large images may still become slow when:
 
 ---
 
-## 11. FAQ
+## 12. FAQ
 
 ### Q1: Why is plain `.RAW` different from camera RAW / DNG?
 
@@ -306,10 +396,9 @@ Although standard-image loading now uses scaled decode, `100%` display and repea
 
 ---
 
-## 12. Development Notes
+## 13. Development Notes
 
 - Main program: `shotwell_compare.py`
 - RAW mapping reference: `SHOTWELL_MAPPING.md`
 - Standard image loading now intentionally follows Shotwell's `scaled_read()` idea
 - When changing UI behavior, avoid breaking RAW decode / RAW sampling code paths
-

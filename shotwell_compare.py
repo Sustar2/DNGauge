@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import concurrent.futures
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -19,7 +20,7 @@ from typing import Optional
 import numpy as np
 
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QTransform, QImageReader
+from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QTransform, QImageReader
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -75,6 +76,28 @@ RAW_EXTS = {
     ".rwz", ".x3f", ".srw",
 }
 DROP_EXTS = RAW_EXTS | {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+
+
+def resource_path(name: str) -> str:
+    candidates = []
+    meipass_dir = getattr(sys, "_MEIPASS", None)
+    if meipass_dir:
+        candidates.append(Path(meipass_dir) / name)
+    candidates.append(Path(sys.executable).resolve().parent / name)
+    candidates.append(Path(__file__).resolve().parent / name)
+    candidates.append(Path(__file__).resolve().parent / "packaging" / name)
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[0])
+
+
+def configure_app_identity() -> None:
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DNGauge")
+        except Exception:
+            pass
 
 DEFAULT_ADJUSTMENTS = {
     "exposure": 0,
@@ -1576,7 +1599,7 @@ class Window(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DNG_COMPARE - Shotwell RAW pipeline")
+        self.setWindowTitle("DNGauge - Shotwell RAW pipeline")
         self.resize(1500, 900)
         self.setAcceptDrops(True)
         self._apply_modern_theme()
@@ -2218,8 +2241,23 @@ class Window(QMainWindow):
 
 
 def main():
+    configure_app_identity()
     app = QApplication(sys.argv)
+    app.setApplicationName("DNGauge")
+    if hasattr(app, "setApplicationDisplayName"):
+        app.setApplicationDisplayName("DNGauge")
+    if hasattr(app, "setDesktopFileName"):
+        app.setDesktopFileName("DNGauge")
+    app_icon = QIcon()
+    for icon_path in (resource_path("DNGauge.png"), resource_path("DNGauge.ico")):
+        if os.path.exists(icon_path):
+            app_icon = QIcon(icon_path)
+            if not app_icon.isNull():
+                app.setWindowIcon(app_icon)
+                break
     w = Window()
+    if not app_icon.isNull():
+        w.setWindowIcon(app_icon)
 
     args = [a for a in sys.argv[1:] if os.path.isfile(a)]
     if len(args) >= 1:

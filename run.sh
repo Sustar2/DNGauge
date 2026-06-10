@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# DNG_COMPARE 启动脚本（固定使用 conda 环境 dng_compare）
+# DNGauge 启动脚本（固定使用 conda 环境 dng_compare）
 # 用法:
 #   ./run.sh
 #   ./run.sh left.dng right.dng
