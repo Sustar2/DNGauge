@@ -36,8 +36,17 @@ Desktop integration:
 - `dng`
 - Plain `.raw`
 
-4. Main buttons
----------------
+4. Main features
+----------------
+
+- left/right image comparison
+- synchronized zoom and pan
+- mixed RAW / DNG / JPG / PNG comparison
+- `Value:显示(渲染)` and `Value:RAW` sampling
+- plain `.RAW` manual metadata input and RAW adjustment
+
+5. Usage guide
+--------------
 
 Top toolbar:
 
@@ -69,8 +78,7 @@ RAW adjustment panel:
 - white balance enable
 - `WB R / G / B`
 
-5. Comparison and sampling
---------------------------
+Comparison and sampling:
 
 - left and right images can have different sizes
 - comparison uses proportional coordinate mapping
@@ -78,15 +86,14 @@ RAW adjustment panel:
 - `Value:RAW` shows RAW value, coordinate, channel, and dtype
 - `Value:显示(渲染)` shows rendered RGB / gray values
 
-6. RAW notes
-------------
+RAW notes:
 
 - RAW-only controls work only for editable plain `.RAW` panes
 - if a pane contains `DNG`, `JPG`, `PNG`, or another non-plain-RAW image, RAW controls for that pane are disabled
 - plain `.RAW` that cannot be recognized automatically will ask for:
   width, height, bit depth, Bayer pattern, and packing format
 
-7. Notes
+6. Notes
 --------
 
 - no Python / conda environment is required
