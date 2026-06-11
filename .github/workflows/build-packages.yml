@@ -1,11 +1,13 @@
-name: Build Packages
+name: Release From Release Folder
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-  pull_request:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   build-linux:
@@ -30,14 +32,16 @@ jobs:
 
       - name: Build Linux executable
         run: |
-          chmod +x build_linux.sh
-          PYTHON_BIN=python ./build_linux.sh
+          chmod +x packaging/build_linux.sh
+          chmod +x packaging/package_portable_linux.sh
+          PYTHON_BIN=python ./packaging/build_linux.sh
+          ./packaging/package_portable_linux.sh
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DNGauge-linux
-          path: dist/DNGauge
+          name: release-linux
+          path: release/*
 
   build-windows:
     runs-on: windows-latest
@@ -55,11 +59,44 @@ jobs:
           python -m pip install pyinstaller
 
       - name: Build Windows executable
-        run: build_windows.bat
+        run: packaging\build_windows.bat
+        shell: cmd
+
+      - name: Package Windows portable release
+        run: packaging\package_windows_portable.bat
         shell: cmd
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DNGauge-windows
-          path: dist/DNGauge.exe
+          name: release-windows
+          path: release/*
+
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-linux
+      - build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: release-assets
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: release-assets
+
+      - name: Show release files
+        run: find release-assets -maxdepth 2 -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/*

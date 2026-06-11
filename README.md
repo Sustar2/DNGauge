@@ -145,15 +145,33 @@ Branding:
 
 ### GitHub Actions
 
-This repo also includes a cross-platform build workflow:
+This repo includes a GitHub release workflow:
 
 ```text
 .github/workflows/build-packages.yml
 ```
 
-It builds:
-- Linux artifact: `DNGauge-linux`
-- Windows artifact: `DNGauge-windows`
+It packages files into `release/` and publishes the files from `release/` as the GitHub Release assets.
+
+### GitHub Release
+
+Recommended release flow:
+
+1. commit all changes to `main`
+2. create a version tag such as `v0.1.0`
+3. push the tag
+4. GitHub Actions will:
+   - build Linux and Windows packages
+   - place final archives into `release/`
+   - create a GitHub Release automatically
+   - attach the files found in `release/`
+
+Example:
+
+```bash
+git tag -a v0.1.0 -m "DNGauge v0.1.0"
+git push origin main --tags
+```
 
 ### Linux runtime note
 
@@ -165,7 +183,17 @@ libxcb-xinerama0
 
 ### Portable release layout
 
-The generated Linux portable folder keeps only the files needed by end users:
+The release process is centered on the `release/` directory.
+
+Typical final contents:
+
+```text
+release/
+├── DNGauge-linux-portable.zip
+└── DNGauge-windows-portable.zip
+```
+
+The Linux portable folder used to build the archive keeps only the files needed by end users:
 
 ```text
 release/DNGauge-linux-portable/
@@ -174,6 +202,17 @@ release/DNGauge-linux-portable/
 ├── DNGauge.png              # Icon used by launcher/window
 ├── DNGauge.desktop.template # Template for re-installing launcher
 ├── install_desktop_launcher.sh
+├── README_RUN.txt
+├── README_RUN_CN.txt
+└── README_RUN_EN.txt
+```
+
+Windows release package:
+
+```text
+release/DNGauge-windows-portable/
+├── DNGauge.exe
+├── DNGauge.ico
 ├── README_RUN.txt
 ├── README_RUN_CN.txt
 └── README_RUN_EN.txt
