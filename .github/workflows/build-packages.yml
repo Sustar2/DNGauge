@@ -11,37 +11,78 @@ permissions:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    name: Build Linux (Ubuntu ${{ matrix.ubuntu }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ubuntu: "20.04"
+            glibc: "2.31"
+            artifact_suffix: ubuntu20.04-x86_64
+          - ubuntu: "22.04"
+            glibc: "2.35"
+            artifact_suffix: ubuntu22.04-x86_64
+          - ubuntu: "24.04"
+            glibc: "2.39"
+            artifact_suffix: ubuntu24.04-x86_64
+    container:
+      image: ubuntu:${{ matrix.ubuntu }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Install system libraries
+      - name: Install build environment
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb-xinerama0
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            git \
+            libgl1 \
+            libxcb-xinerama0 \
+            patchelf \
+            python3 \
+            python3-dev \
+            python3-pip
+
+      - uses: actions/checkout@v4
 
       - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
+          python3 -m pip install --upgrade "pip<25.1"
+          python3 -m pip install -r requirements.txt
+          python3 -m pip install "pyinstaller<7"
 
       - name: Build Linux executable
         run: |
           chmod +x packaging/build_linux.sh
           chmod +x packaging/package_portable_linux.sh
-          PYTHON_BIN=python ./packaging/build_linux.sh
+          PYTHON_BIN=python3 ./packaging/build_linux.sh
+
+      - name: Verify Ubuntu ${{ matrix.ubuntu }} compatibility
+        run: |
+          python3 packaging/check_linux_glibc.py dist/DNGauge "${{ matrix.glibc }}"
+          set +e
+          QT_QPA_PLATFORM=offscreen timeout 10s ./dist/DNGauge
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+            echo "DNGauge failed the headless startup test (exit code: $status)"
+            exit "$status"
+          fi
+
+      - name: Package Linux release
+        run: |
           ./packaging/package_portable_linux.sh
+          mv release/DNGauge-linux-portable.tar.gz \
+            "release/DNGauge-linux-${{ matrix.artifact_suffix }}.tar.gz"
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-linux
-          path: release/*
+          name: release-linux-${{ matrix.artifact_suffix }}
+          path: release/DNGauge-linux-${{ matrix.artifact_suffix }}.tar.gz
 
   build-windows:
     runs-on: windows-latest
@@ -82,8 +123,9 @@ jobs:
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
-          name: release-linux
+          pattern: release-linux-*
           path: release-assets
+          merge-multiple: true
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v4

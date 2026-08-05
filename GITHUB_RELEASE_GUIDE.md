@@ -22,7 +22,9 @@ When you push a tag like `v0.1.0`, GitHub Actions will:
 
 Typical examples:
 
-- `release/DNGauge-linux-portable.zip`
+- `release/DNGauge-linux-ubuntu20.04-x86_64.tar.gz`
+- `release/DNGauge-linux-ubuntu22.04-x86_64.tar.gz`
+- `release/DNGauge-linux-ubuntu24.04-x86_64.tar.gz`
 - `release/DNGauge-windows-portable.zip`
 
 ## How to publish
