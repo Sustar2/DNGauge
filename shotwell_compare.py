@@ -8,6 +8,8 @@ Reference (Shotwell source):
 - src/photos/RawSupport.vala::RawReader
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import tempfile
