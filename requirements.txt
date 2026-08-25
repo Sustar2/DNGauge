@@ -1,5 +1,5 @@
 PyQt5>=5.15
-numpy>=1.21
+numpy>=1.26,<2.0
 Pillow>=9.0
 rawpy>=0.18
 pidng>=4.0.9

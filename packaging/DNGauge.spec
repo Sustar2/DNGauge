@@ -3,19 +3,27 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_delvewheel_libs_directory,
+    collect_dynamic_libs,
+    collect_submodules,
+    copy_metadata,
+)
 
 SCRIPT_DIR = (Path(os.getcwd()) / "packaging").resolve()
 PROJECT_ROOT = SCRIPT_DIR.parent
 
-hiddenimports = []
+hiddenimports = collect_submodules(
+    "numpy", filter=lambda name: ".tests" not in name and not name.endswith(".tests")
+)
 hiddenimports += collect_submodules("pidng")
 hiddenimports += collect_submodules("rawpy")
 
 binaries = []
 binaries += collect_dynamic_libs("rawpy")
 
-datas = []
+datas = copy_metadata("numpy")
+datas, binaries = collect_delvewheel_libs_directory("numpy", datas=datas, binaries=binaries)
 for asset_name in ["DNGauge.png", "DNGauge.ico"]:
     asset_path = SCRIPT_DIR / asset_name
     if asset_path.exists():

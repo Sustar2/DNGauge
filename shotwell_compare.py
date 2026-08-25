@@ -2543,6 +2543,11 @@ class Window(QMainWindow):
 
 
 def main():
+    # Used by packaging CI to prove that all top-level dependencies (notably
+    # NumPy/rawpy/Pillow/PyQt5) can be imported from the frozen executable.
+    if "--self-test" in sys.argv:
+        return
+
     configure_app_identity()
     app = QApplication(sys.argv)
     app.setApplicationName("DNGauge")
