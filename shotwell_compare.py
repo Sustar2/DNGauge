@@ -21,7 +21,7 @@ from typing import Optional
 
 import numpy as np
 
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon, QImage, QPixmap, QPainter, QTransform, QImageReader
 from PyQt5.QtWidgets import (
     QApplication,
@@ -67,7 +67,7 @@ except Exception:
     PIDNG_AVAILABLE = False
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except Exception as e:
     raise RuntimeError("需要 Pillow 读取非 RAW 图片") from e
 
@@ -313,13 +313,6 @@ def qimage_to_rgb_array(qimg: QImage) -> np.ndarray:
     ptr.setsize(h * bpl)
     arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, bpl)
     return np.ascontiguousarray(arr[:, : w * 3].reshape(h, w, 3))
-
-
-def fit_dimensions(full_w: int, full_h: int, target_w: int, target_h: int) -> tuple[int, int]:
-    if full_w <= 0 or full_h <= 0 or target_w <= 0 or target_h <= 0:
-        return max(1, full_w), max(1, full_h)
-    scale = min(target_w / float(full_w), target_h / float(full_h), 1.0)
-    return max(1, int(round(full_w * scale))), max(1, int(round(full_h * scale)))
 
 
 def raw_to_display_rgb(
@@ -820,46 +813,32 @@ class ShotwellRawDecoder:
     def _load_regular(
         path: str, target_size: Optional[tuple[int, int]] = None
     ) -> tuple[np.ndarray, Optional[dict]]:
+        """Load a rendered image at full resolution, matching the RAW compare path.
+
+        ``target_size`` is retained for API compatibility but intentionally ignored.
+        Downsampling here would permanently change the PNG/JPEG pixel grid while DNG
+        remains full-size, which breaks synchronized 1:1 comparison and LOCATE.
+        The view is responsible for fitting the full-resolution image to the window.
+        """
+        # Qt 5's PNG reader can segfault (rather than return an error) on some
+        # 16-bit-per-channel RGB PNGs.  Pillow handles those files reliably and
+        # converts them to the same 8-bit RGB display space used by RAW postprocess.
+        if Path(path).suffix.lower() == ".png":
+            with Image.open(path) as img:
+                oriented = ImageOps.exif_transpose(img)
+                arr = np.array(oriented.convert("RGB"), dtype=np.uint8)
+            return np.ascontiguousarray(arr), None
+
         reader = QImageReader(path)
         reader.setAutoTransform(True)
-        full_size = reader.size()
-
-        if target_size is not None and full_size.isValid():
-            target_w = max(1, int(target_size[0]))
-            target_h = max(1, int(target_size[1]))
-            scaled_w, scaled_h = fit_dimensions(
-                max(1, full_size.width()),
-                max(1, full_size.height()),
-                target_w,
-                target_h,
-            )
-
-            if (full_size.width() > 9999 or full_size.height() > 9999) and (scaled_w < 100 or scaled_h < 100):
-                prefetch_w, prefetch_h = fit_dimensions(
-                    max(1, full_size.width()),
-                    max(1, full_size.height()),
-                    1000,
-                    1000,
-                )
-                reader.setScaledSize(QSize(prefetch_w, prefetch_h))
-                prefetched = reader.read()
-                if not prefetched.isNull():
-                    downsampled = prefetched.scaled(
-                        scaled_w, scaled_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-                    )
-                    return qimage_to_rgb_array(downsampled), None
-                reader = QImageReader(path)
-                reader.setAutoTransform(True)
-
-            if (scaled_w, scaled_h) != (full_size.width(), full_size.height()):
-                reader.setScaledSize(QSize(scaled_w, scaled_h))
 
         qimg = reader.read()
         if not qimg.isNull():
             return qimage_to_rgb_array(qimg), None
 
         with Image.open(path) as img:
-            arr = np.array(img.convert("RGB"), dtype=np.uint8)
+            oriented = ImageOps.exif_transpose(img)
+            arr = np.array(oriented.convert("RGB"), dtype=np.uint8)
         return np.ascontiguousarray(arr), None
 
 
