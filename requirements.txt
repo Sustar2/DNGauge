@@ -1,5 +1,6 @@
 PyQt5>=5.15
-numpy==1.26.4
+numpy==1.24.4; python_version < "3.9"
+numpy==1.26.4; python_version >= "3.9"
 Pillow>=9.0
 rawpy>=0.18
 pidng>=4.0.9
