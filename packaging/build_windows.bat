@@ -10,6 +10,17 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
 python -m PyInstaller --noconfirm --distpath "%PROJECT_ROOT%\dist" --workpath "%PROJECT_ROOT%\build" "%SCRIPT_DIR%DNGauge.spec"
+if errorlevel 1 (
+    echo.
+    echo ERROR: Windows build failed.
+    exit /b 1
+)
+
+if not exist "%PROJECT_ROOT%\dist\DNGauge.exe" (
+    echo.
+    echo ERROR: DNGauge.exe was not created.
+    exit /b 1
+)
 
 echo.
 echo Windows executable created:

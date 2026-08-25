@@ -123,6 +123,11 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install "pyinstaller<7"
 
+      - name: Verify Windows build dependencies
+        run: |
+          python -c "import numpy, rawpy, PIL, PyQt5; print('numpy', numpy.__version__); print('rawpy', rawpy.__version__)"
+          python -m pip show numpy rawpy pyinstaller
+
       - name: Build Windows executable
         run: packaging\build_windows.bat
         shell: cmd
