@@ -11,6 +11,7 @@ Reference (Shotwell source):
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 import concurrent.futures
@@ -313,6 +314,92 @@ def qimage_to_rgb_array(qimg: QImage) -> np.ndarray:
     ptr.setsize(h * bpl)
     arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, bpl)
     return np.ascontiguousarray(arr[:, : w * 3].reshape(h, w, 3))
+
+
+def parse_raw_metadata_txt(path: str, raw_filename: str = "") -> dict:
+    """Parse Poland RAW/HDR metadata, selecting the RAW file's frame when possible."""
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    frame_blocks = [
+        block for block in re.split(r"(?=^\s*ID:\s*\d+)", text, flags=re.MULTILINE)
+        if re.search(r"^\s*ID:\s*\d+", block, flags=re.MULTILINE)
+    ]
+    if not frame_blocks:
+        frame_blocks = [text]
+
+    requested_id = None
+    name_match = re.search(r"(?:input|frame)[_-]?(\d+)", raw_filename, flags=re.IGNORECASE)
+    if name_match:
+        requested_id = int(name_match.group(1))
+
+    block = frame_blocks[0]
+    selected_id = None
+    if requested_id is not None:
+        for candidate in frame_blocks:
+            id_match = re.search(r"^\s*ID:\s*(\d+)", candidate, flags=re.MULTILINE)
+            if id_match and int(id_match.group(1)) == requested_id:
+                block = candidate
+                selected_id = requested_id
+                break
+    if selected_id is None:
+        id_match = re.search(r"^\s*ID:\s*(\d+)", block, flags=re.MULTILINE)
+        if id_match:
+            selected_id = int(id_match.group(1))
+
+    cfg = {"metadata_path": str(path), "metadata_frame_id": selected_id}
+
+    size_match = re.search(
+        r"ImageSize\s*\(\s*width:\s*(\d+)\s*,\s*height:\s*(\d+)\s*,\s*stride:\s*(\d+)\s*\)",
+        block,
+        flags=re.IGNORECASE,
+    )
+    stride = None
+    if size_match:
+        width, height, stride = (int(v) for v in size_match.groups())
+        cfg.update({"width": width, "height": height, "stride": stride})
+
+    layout_match = re.search(r"^\s*bayer_layout:\s*(\d+)", block, flags=re.MULTILINE | re.IGNORECASE)
+    if layout_match:
+        layout = int(layout_match.group(1))
+        patterns = {0: "RGGB", 1: "GRBG", 2: "GBRG", 3: "BGGR"}
+        if layout not in patterns:
+            raise ValueError(f"不支持的 bayer_layout: {layout}")
+        cfg["pattern"] = patterns[layout]
+
+    wb_match = re.search(
+        r"^\s*WbGain:\s*([-+\d.eE]+)\s*,\s*([-+\d.eE]+)\s*,\s*([-+\d.eE]+)",
+        block,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    if not wb_match:
+        raise ValueError("TXT 中没有找到 WbGain:R,G,B")
+    wb = tuple(float(v) for v in wb_match.groups())
+    if any(v <= 0 for v in wb):
+        raise ValueError(f"WbGain 必须大于 0: {wb}")
+    cfg.update({"wb_enabled": True, "wb": wb})
+
+    black_match = re.search(r"^\s*BlackLevel:\s*(\d+)", block, flags=re.MULTILINE | re.IGNORECASE)
+    if black_match:
+        cfg["black_level"] = int(black_match.group(1))
+
+    white_match = re.search(r"^\s*WhiteLevel:\s*(\d+)", block, flags=re.MULTILINE | re.IGNORECASE)
+    if white_match:
+        white_level = int(white_match.group(1))
+        cfg["white_level"] = white_level
+        cfg["bit"] = max(1, min(16, white_level.bit_length()))
+
+    width = cfg.get("width")
+    bit = cfg.get("bit")
+    if width and stride:
+        if stride == width * 2:
+            cfg["packing"] = "u16"
+        elif bit == 10 and stride == (width * 10 + 7) // 8:
+            cfg["packing"] = "mipi10"
+        elif bit == 12 and stride == (width * 12 + 7) // 8:
+            cfg["packing"] = "mipi12"
+        elif stride == width:
+            cfg["packing"] = "u8"
+
+    return cfg
 
 
 def raw_to_display_rgb(
@@ -764,15 +851,19 @@ class ShotwellRawDecoder:
         mask = (1 << bit) - 1 if 1 <= bit <= 16 else 0xFFFF
         raw = (raw & mask).astype(np.uint16)
         _linear_rgb, cfa = cls._demosaic_bilinear_linear(raw, pattern)
-        white_level = int(mask)
+        black_level = int(max(0, min(mask - 1, int(cfg.get("black_level", 0)))))
+        white_level = int(max(black_level + 1, min(mask, int(cfg.get("white_level", mask)))))
+        wb_enabled = bool(cfg.get("wb_enabled", False))
+        wb_values = cfg.get("wb", (1.0, 1.0, 1.0))
+        wb = tuple(float(v) for v in wb_values)
         rgb = render_plain_raw_with_matrix(
             raw,
             pattern=pattern,
-            black_level=0,
+            black_level=black_level,
             white_level=white_level,
             exposure_gain=1.0,
-            wb_enabled=False,
-            wb=(1.0, 1.0, 1.0),
+            wb_enabled=wb_enabled,
+            wb=wb,
             bit=bit,
         )
         raw_info = {
@@ -780,10 +871,14 @@ class ShotwellRawDecoder:
             "cfa": cfa,
             "desc": "RGB",
             "bit": bit,
-            "black_level": 0,
+            "black_level": black_level,
             "white_level": white_level,
             "pattern": pattern,
             "plain_raw": True,
+            "wb_enabled": wb_enabled,
+            "wb": wb,
+            "metadata_path": cfg.get("metadata_path"),
+            "metadata_frame_id": cfg.get("metadata_frame_id"),
         }
         return np.ascontiguousarray(rgb), raw_info
 
@@ -820,10 +915,9 @@ class ShotwellRawDecoder:
         remains full-size, which breaks synchronized 1:1 comparison and LOCATE.
         The view is responsible for fitting the full-resolution image to the window.
         """
-        # Qt 5's PNG reader can segfault (rather than return an error) on some
-        # 16-bit-per-channel RGB PNGs.  Pillow handles those files reliably and
-        # converts them to the same 8-bit RGB display space used by RAW postprocess.
-        if Path(path).suffix.lower() == ".png":
+        # Keep PNG and JPEG on one full-resolution decode path.  Pillow also avoids
+        # a Qt 5 PNG-reader segfault seen with some 16-bit-per-channel RGB files.
+        if Path(path).suffix.lower() in {".png", ".jpg", ".jpeg"}:
             with Image.open(path) as img:
                 oriented = ImageOps.exif_transpose(img)
                 arr = np.array(oriented.convert("RGB"), dtype=np.uint8)
@@ -1144,8 +1238,9 @@ class Pane(QWidget):
             self.raw_black_level = int(self.raw_info.get("black_level", 0))
             self.raw_white_level = int(self.raw_info.get("white_level", maxv))
             self.raw_exposure_gain = 1.0
-            self.raw_wb_enabled = False
-            self.raw_wb = (1.0, 1.0, 1.0)
+            self.raw_wb_enabled = bool(self.raw_info.get("wb_enabled", False))
+            wb = self.raw_info.get("wb", (1.0, 1.0, 1.0))
+            self.raw_wb = tuple(float(v) for v in wb)
         self.params = dict(DEFAULT_ADJUSTMENTS)
         self.render_current(reset_view=True)
 
@@ -1390,8 +1485,98 @@ class AdjustPanel(QGroupBox):
         self.changed.emit(self.values())
 
 
+class MetadataDropLabel(QLabel):
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__("拖入 metadata TXT，自动应用 WB", parent)
+        self.setAcceptDrops(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setWordWrap(True)
+        self.setMinimumHeight(42)
+        self.setStyleSheet(
+            "QLabel { color:#aaaaaa; border:1px dashed #666666; "
+            "border-radius:4px; padding:6px; background:#333333; }"
+        )
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasUrls() and any(
+            url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".txt"
+            for url in md.urls()
+        ):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not md or not md.hasUrls():
+            event.ignore()
+            return
+        for url in md.urls():
+            if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".txt":
+                self.file_dropped.emit(url.toLocalFile())
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def show_result(self, text: str, success: bool):
+        color = "#8fd19e" if success else "#ff9696"
+        border = "#4b9b63" if success else "#c75b5b"
+        self.setText(text)
+        self.setStyleSheet(
+            f"QLabel {{ color:{color}; border:1px solid {border}; "
+            "border-radius:4px; padding:6px; background:#333333; }"
+        )
+
+    def reset_result(self):
+        self.setText("把 metadata TXT 拖到本页任意位置\n自动识别并重新加载 RAW")
+        self.setStyleSheet(
+            "QLabel { color:#aaaaaa; border:1px dashed #666666; "
+            "border-radius:4px; padding:6px; background:#333333; }"
+        )
+
+
+class MetadataDropTab(QWidget):
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasUrls() and any(
+            url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".txt"
+            for url in md.urls()
+        ):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not md or not md.hasUrls():
+            event.ignore()
+            return
+        for url in md.urls():
+            if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".txt":
+                self.file_dropped.emit(url.toLocalFile())
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+
 class RawAdjustPanel(QGroupBox):
     changed = pyqtSignal(str, dict)  # pane_id, {channel, bit, black, white, exposure, wb_enabled, wb_r, wb_g, wb_b}
+    metadata_dropped = pyqtSignal(str, str)  # pane_id, txt_path
 
     def __init__(self, parent=None):
         super().__init__("RAW 调参", parent)
@@ -1424,7 +1609,8 @@ class RawAdjustPanel(QGroupBox):
         lay.addWidget(tabs)
 
     def _build_tab(self, pane_id: str) -> QWidget:
-        w = QWidget()
+        w = MetadataDropTab()
+        w.file_dropped.connect(lambda path, pid=pane_id: self.metadata_dropped.emit(pid, path))
         lay = QVBoxLayout(w)
         hint = QLabel("")
         hint.setWordWrap(True)
@@ -1442,9 +1628,9 @@ class RawAdjustPanel(QGroupBox):
         white = QSpinBox(); white.setRange(1, 65535); white.setValue(65535)
         exp = QDoubleSpinBox(); exp.setRange(0.01, 32.0); exp.setSingleStep(0.05); exp.setValue(1.0)
         wb_en = QCheckBox("启用 WB")
-        wb_r = QDoubleSpinBox(); wb_r.setRange(0.1, 8.0); wb_r.setSingleStep(0.01); wb_r.setValue(1.0)
-        wb_g = QDoubleSpinBox(); wb_g.setRange(0.1, 8.0); wb_g.setSingleStep(0.01); wb_g.setValue(1.0)
-        wb_b = QDoubleSpinBox(); wb_b.setRange(0.1, 8.0); wb_b.setSingleStep(0.01); wb_b.setValue(1.0)
+        wb_r = QDoubleSpinBox(); wb_r.setRange(0.1, 8.0); wb_r.setDecimals(6); wb_r.setSingleStep(0.01); wb_r.setValue(1.0)
+        wb_g = QDoubleSpinBox(); wb_g.setRange(0.1, 8.0); wb_g.setDecimals(6); wb_g.setSingleStep(0.01); wb_g.setValue(1.0)
+        wb_b = QDoubleSpinBox(); wb_b.setRange(0.1, 8.0); wb_b.setDecimals(6); wb_b.setSingleStep(0.01); wb_b.setValue(1.0)
         ch.currentTextChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
         bit.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
         black.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
@@ -1464,9 +1650,15 @@ class RawAdjustPanel(QGroupBox):
         form.addRow("WB G", wb_g)
         form.addRow("WB B", wb_b)
         lay.addWidget(form_wrap)
+        meta_drop = MetadataDropLabel()
+        meta_drop.setText("把 metadata TXT 拖到本页任意位置\n自动识别并重新加载 RAW")
+        meta_drop.setMinimumHeight(100)
+        meta_drop.file_dropped.connect(lambda path, pid=pane_id: self.metadata_dropped.emit(pid, path))
+        lay.addWidget(meta_drop)
         self._widgets[pane_id] = {
             "channel": ch, "bit": bit, "black": black, "white": white, "exp": exp,
-            "wb_en": wb_en, "wb_r": wb_r, "wb_g": wb_g, "wb_b": wb_b
+            "wb_en": wb_en, "wb_r": wb_r, "wb_g": wb_g, "wb_b": wb_b,
+            "meta_drop": meta_drop,
         }
         self._tabs[pane_id] = w
         self._hints[pane_id] = hint
@@ -1514,12 +1706,24 @@ class RawAdjustPanel(QGroupBox):
             hint.setText(reason)
             hint.setVisible(bool(reason))
 
+    def show_metadata_result(self, pane_id: str, text: str, success: bool):
+        drop = self._widgets.get(pane_id, {}).get("meta_drop")
+        if drop is not None:
+            drop.show_result(text, success)
+
+    def reset_metadata_result(self, pane_id: str):
+        drop = self._widgets.get(pane_id, {}).get("meta_drop")
+        if drop is not None:
+            drop.reset_result()
 
 class RawLoadConfigDialog(QDialog):
     def __init__(self, parent=None, default_text: str = "4096,3072,10,RGGB,u16", filename: str = ""):
         super().__init__(parent)
         self.setWindowTitle("RAW 加载配置")
-        self.resize(380, 260)
+        self.resize(440, 390)
+        self.setAcceptDrops(True)
+        self.raw_filename = filename
+        self._metadata_cfg = {}
         self.setStyleSheet("""
             QDialog, QWidget { color: #000000; background: #ffffff; }
             QComboBox, QSpinBox, QPushButton, QLabel {
@@ -1552,22 +1756,80 @@ class RawLoadConfigDialog(QDialog):
         form.addRow("Bayer", self.cb_p)
         form.addRow("Packing", self.cb_k)
 
+        self.meta_drop = MetadataDropLabel()
+        self.meta_drop.setText("把 metadata TXT 拖到这里\n自动读取 RAW 配置和白平衡")
+        self.meta_drop.setMinimumHeight(100)
+        self.meta_drop.file_dropped.connect(self._apply_metadata_txt)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
         lay = QVBoxLayout(self)
         lay.addLayout(form)
+        lay.addWidget(self.meta_drop)
         lay.addWidget(buttons)
 
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasUrls() and any(
+            url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".txt"
+            for url in md.urls()
+        ):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not md or not md.hasUrls():
+            event.ignore()
+            return
+        for url in md.urls():
+            if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".txt":
+                self._apply_metadata_txt(url.toLocalFile())
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def _apply_metadata_txt(self, path: str):
+        try:
+            cfg = parse_raw_metadata_txt(path, self.raw_filename)
+            self._metadata_cfg = cfg
+            if "width" in cfg:
+                self.sp_w.setValue(int(cfg["width"]))
+            if "height" in cfg:
+                self.sp_h.setValue(int(cfg["height"]))
+            if "bit" in cfg:
+                self.sp_b.setValue(int(cfg["bit"]))
+            if "pattern" in cfg:
+                self.cb_p.setCurrentText(str(cfg["pattern"]))
+            if "packing" in cfg:
+                self.cb_k.setCurrentText(str(cfg["packing"]))
+            wb = tuple(float(v) for v in cfg["wb"])
+            frame_id = cfg.get("metadata_frame_id")
+            frame_text = "" if frame_id is None else f" ID:{frame_id}"
+            self.meta_drop.show_result(
+                f"已读取{frame_text}\nWB {wb[0]:.6f}, {wb[1]:.6f}, {wb[2]:.6f}\n点击“确定”加载",
+                True,
+            )
+        except Exception as e:
+            self._metadata_cfg = {}
+            self.meta_drop.show_result(f"TXT 解析失败:\n{e}", False)
+
     def get_cfg(self) -> dict:
-        return {
+        cfg = dict(self._metadata_cfg)
+        cfg.update({
             "width": int(self.sp_w.value()),
             "height": int(self.sp_h.value()),
             "bit": int(self.sp_b.value()),
             "pattern": self.cb_p.currentText().upper(),
             "packing": self.cb_k.currentText().lower(),
-        }
+        })
+        return cfg
 
     def get_cfg_text(self) -> str:
         c = self.get_cfg()
@@ -1576,6 +1838,7 @@ class RawLoadConfigDialog(QDialog):
 
 class Window(QMainWindow):
     load_done = pyqtSignal(object, object, object, object)   # pane, path, rgb, raw_info_or_error
+    metadata_load_done = pyqtSignal(object, object, object, object, object)  # pane, raw_path, txt_path, rgb, info/error
     adjust_done = pyqtSignal(object, int, object)            # pane, request_id, rgb
 
     def __init__(self):
@@ -1627,6 +1890,7 @@ class Window(QMainWindow):
         self._plain_raw_cfg_text = "4096,3072,10,RGGB,u16"
         self.raw_adj_panel = RawAdjustPanel(self)
         self.raw_adj_panel.changed.connect(self._on_raw_adjust_changed)
+        self.raw_adj_panel.metadata_dropped.connect(self._on_raw_metadata_dropped)
 
         self.btn_l.clicked.connect(lambda: self._load_one(self.left))
         self.btn_r.clicked.connect(lambda: self._load_one(self.right))
@@ -1641,6 +1905,7 @@ class Window(QMainWindow):
         self.btn_fit.clicked.connect(self._fit_all)
         self.btn_link.clicked.connect(self._toggle_link)
         self.load_done.connect(self._on_load_done)
+        self.metadata_load_done.connect(self._on_metadata_load_done)
         self.adjust_done.connect(self._on_adjust_done)
 
         # 顶部功能区：按类别分组
@@ -1842,6 +2107,57 @@ class Window(QMainWindow):
                 self._submit_adjust_render(pane, preview=False)
             else:
                 pane.render_current(reset_view=False)
+
+    def _on_raw_metadata_dropped(self, pane_id: str, txt_path: str):
+        pane = self.left if pane_id == "left" else self.right
+        try:
+            if not pane.source_path or pane.raw_info is None or not pane.raw_info.get("plain_raw"):
+                raise ValueError("请先在这一侧加载裸 .RAW 文件")
+            cfg = parse_raw_metadata_txt(txt_path, os.path.basename(pane.source_path))
+            frame_id = cfg.get("metadata_frame_id")
+            frame_text = "" if frame_id is None else f" ID:{frame_id}"
+            loading_text = f"已识别 TXT{frame_text}，正在重新加载 RAW..."
+            self.raw_adj_panel.show_metadata_result(pane_id, loading_text, True)
+            self.msg.setText(loading_text)
+            raw_path = pane.source_path
+
+            def task():
+                return ShotwellRawDecoder.load(raw_path, target_size=None, plain_raw_cfg=cfg)
+
+            fut = self._executor.submit(task)
+
+            def done_cb(f):
+                try:
+                    rgb, raw_info = f.result()
+                    self.metadata_load_done.emit(pane, raw_path, txt_path, rgb, raw_info)
+                except Exception as e:
+                    self.metadata_load_done.emit(pane, raw_path, txt_path, None, e)
+
+            fut.add_done_callback(done_cb)
+        except Exception as e:
+            text = f"TXT 识别失败: {e}"
+            self.raw_adj_panel.show_metadata_result(pane_id, text, False)
+            self.msg.setText(text)
+
+    def _on_metadata_load_done(
+        self, pane: Pane, raw_path: str, txt_path: str, rgb: Optional[np.ndarray], raw_or_err
+    ):
+        pane_id = "left" if pane is self.left else "right"
+        if pane.source_path != raw_path:
+            return
+        if rgb is None:
+            text = f"TXT 重新加载失败: {raw_or_err}"
+            self.raw_adj_panel.show_metadata_result(pane_id, text, False)
+            self.msg.setText(text)
+            return
+
+        self._on_load_done(pane, raw_path, rgb, raw_or_err)
+        wb = tuple(float(v) for v in raw_or_err.get("wb", (1.0, 1.0, 1.0)))
+        frame_id = raw_or_err.get("metadata_frame_id")
+        frame_text = "" if frame_id is None else f" ID:{frame_id}"
+        result = f"已重新加载{frame_text}  WB {wb[0]:.6f}, {wb[1]:.6f}, {wb[2]:.6f}"
+        self.raw_adj_panel.show_metadata_result(pane_id, result, True)
+        self.msg.setText(result)
 
     def _cycle_bayer_mode(self):
         panes = [pane for pane in (self.left, self.right) if pane.supports_raw_controls()]
@@ -2047,7 +2363,10 @@ class Window(QMainWindow):
         raw_patterns = " ".join(
             sorted({f"*{e}" for e in RAW_EXTS} | {f"*{e.upper()}" for e in RAW_EXTS})
         )
-        img_patterns = "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"
+        image_exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+        img_patterns = " ".join(
+            sorted({f"*{ext}" for ext in image_exts} | {f"*{ext.upper()}" for ext in image_exts})
+        )
         filt = (
             f"RAW/Images ({raw_patterns} {img_patterns});;"
             f"RAW Only ({raw_patterns});;"
@@ -2187,12 +2506,14 @@ class Window(QMainWindow):
             return
         pane.set_baseline(path, rgb, raw_or_err)
         if pane is self.left:
+            self.raw_adj_panel.reset_metadata_result("left")
             self.raw_adj_panel.set_values(
                 "left", self.left.raw_channel_mode, self.left.raw_display_bits,
                 self.left.raw_black_level, self.left.raw_white_level, self.left.raw_exposure_gain,
                 self.left.raw_wb_enabled, self.left.raw_wb[0], self.left.raw_wb[1], self.left.raw_wb[2]
             )
         else:
+            self.raw_adj_panel.reset_metadata_result("right")
             self.raw_adj_panel.set_values(
                 "right", self.right.raw_channel_mode, self.right.raw_display_bits,
                 self.right.raw_black_level, self.right.raw_white_level, self.right.raw_exposure_gain,
