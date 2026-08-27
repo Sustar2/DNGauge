@@ -427,6 +427,13 @@ def raw_to_display_rgb(
     return np.stack([g, g, g], axis=-1)
 
 
+def raw_samples_for_display_bit(raw: np.ndarray, display_bits: int) -> np.ndarray:
+    """Interpret the original integer samples using the currently selected bit depth."""
+    bits = max(1, min(16, int(display_bits)))
+    mask = (1 << bits) - 1
+    return np.bitwise_and(raw, mask).astype(np.uint16, copy=False)
+
+
 def dng_style_linear_rgb_to_srgb(
     rgb: np.ndarray,
     black_level: float,
@@ -571,9 +578,10 @@ def render_raw_all_source_rgb(
     if raw_info is None:
         return base_rgb
     if raw_info.get("plain_raw"):
-        raw = raw_info.get("raw")
+        raw = raw_info.get("raw_source", raw_info.get("raw"))
         pattern = raw_info.get("pattern", "RGGB")
         if raw is not None:
+            raw = raw_samples_for_display_bit(raw, display_bits)
             return render_plain_raw_with_matrix(
                 raw,
                 str(pattern).upper(),
@@ -582,7 +590,7 @@ def render_raw_all_source_rgb(
                 exposure_gain=exposure_gain,
                 wb_enabled=wb_enabled,
                 wb=wb,
-                bit=int(raw_info.get("bit", display_bits)),
+                bit=int(display_bits),
             )
     src = base_rgb
     if wb_enabled:
@@ -848,8 +856,11 @@ class ShotwellRawDecoder:
                 raise ValueError("u16 RAW 数据长度不足")
             raw = u16[:need].reshape(h, w)
 
+        # Keep the untouched integer samples. Display-bit changes must be able to
+        # reinterpret the source instead of reusing data truncated at load time.
+        raw_source = raw.astype(np.uint16, copy=False)
         mask = (1 << bit) - 1 if 1 <= bit <= 16 else 0xFFFF
-        raw = (raw & mask).astype(np.uint16)
+        raw = raw_samples_for_display_bit(raw_source, bit)
         _linear_rgb, cfa = cls._demosaic_bilinear_linear(raw, pattern)
         black_level = int(max(0, min(mask - 1, int(cfg.get("black_level", 0)))))
         white_level = int(max(black_level + 1, min(mask, int(cfg.get("white_level", mask)))))
@@ -868,6 +879,7 @@ class ShotwellRawDecoder:
         )
         raw_info = {
             "raw": raw,
+            "raw_source": raw_source,
             "cfa": cfa,
             "desc": "RGB",
             "bit": bit,
@@ -1265,10 +1277,12 @@ class Pane(QWidget):
         if self.base_rgb is None:
             return
         if self.raw_info is not None and self.raw_channel_mode != "ALL":
-            raw = self.raw_info.get("raw")
+            raw = self.raw_info.get("raw_source", self.raw_info.get("raw"))
             cfa = self.raw_info.get("cfa")
             desc = self.raw_info.get("desc", "RGBG")
             if raw is not None and cfa is not None:
+                if self.raw_info.get("plain_raw"):
+                    raw = raw_samples_for_display_bit(raw, self.raw_display_bits)
                 out = raw_channel_to_display_rgb(
                     raw, cfa, desc, self.raw_channel_mode, self.raw_display_bits,
                     self.raw_black_level, self.raw_white_level, self.raw_exposure_gain
@@ -1534,7 +1548,7 @@ class MetadataDropLabel(QLabel):
         )
 
     def reset_result(self):
-        self.setText("把 metadata TXT 拖到本页任意位置\n自动识别并重新加载 RAW")
+        self.setText("把 metadata TXT 拖到本页任意位置\n导入参数，但保留当前显示 Bit 和 WB 开关")
         self.setStyleSheet(
             "QLabel { color:#aaaaaa; border:1px dashed #666666; "
             "border-radius:4px; padding:6px; background:#333333; }"
@@ -1632,7 +1646,7 @@ class RawAdjustPanel(QGroupBox):
         wb_g = QDoubleSpinBox(); wb_g.setRange(0.1, 8.0); wb_g.setDecimals(6); wb_g.setSingleStep(0.01); wb_g.setValue(1.0)
         wb_b = QDoubleSpinBox(); wb_b.setRange(0.1, 8.0); wb_b.setDecimals(6); wb_b.setSingleStep(0.01); wb_b.setValue(1.0)
         ch.currentTextChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
-        bit.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
+        bit.valueChanged.connect(lambda value, pid=pane_id: self._on_display_bit_changed(pid, value))
         black.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
         white.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
         exp.valueChanged.connect(lambda _v, pid=pane_id: self._emit(pid))
@@ -1651,7 +1665,7 @@ class RawAdjustPanel(QGroupBox):
         form.addRow("WB B", wb_b)
         lay.addWidget(form_wrap)
         meta_drop = MetadataDropLabel()
-        meta_drop.setText("把 metadata TXT 拖到本页任意位置\n自动识别并重新加载 RAW")
+        meta_drop.setText("把 metadata TXT 拖到本页任意位置\n导入参数，但保留当前显示 Bit 和 WB 开关")
         meta_drop.setMinimumHeight(100)
         meta_drop.file_dropped.connect(lambda path, pid=pane_id: self.metadata_dropped.emit(pid, path))
         lay.addWidget(meta_drop)
@@ -1696,6 +1710,18 @@ class RawAdjustPanel(QGroupBox):
                 "wb_b": float(ws["wb_b"].value()),
             }
         )
+
+    def _on_display_bit_changed(self, pane_id: str, bit: int):
+        """Keep normalization range aligned with the selected display bit depth."""
+        ws = self._widgets[pane_id]
+        white = ws["white"]
+        target_white = (1 << max(1, min(16, int(bit)))) - 1
+        white.blockSignals(True)
+        try:
+            white.setValue(target_white)
+        finally:
+            white.blockSignals(False)
+        self._emit(pane_id)
 
     def set_pane_enabled(self, pane_id: str, enabled: bool, reason: str = ""):
         tab = self._tabs.get(pane_id)
@@ -1838,7 +1864,8 @@ class RawLoadConfigDialog(QDialog):
 
 class Window(QMainWindow):
     load_done = pyqtSignal(object, object, object, object)   # pane, path, rgb, raw_info_or_error
-    metadata_load_done = pyqtSignal(object, object, object, object, object)  # pane, raw_path, txt_path, rgb, info/error
+    metadata_load_done = pyqtSignal(object, object, object, object, object, object)
+    # pane, raw_path, txt_path, preserved_display_state, rgb, info/error
     adjust_done = pyqtSignal(object, int, object)            # pane, request_id, rgb
 
     def __init__(self):
@@ -2113,6 +2140,15 @@ class Window(QMainWindow):
         try:
             if not pane.source_path or pane.raw_info is None or not pane.raw_info.get("plain_raw"):
                 raise ValueError("请先在这一侧加载裸 .RAW 文件")
+            display_state = {
+                "channel": pane.raw_channel_mode,
+                "bit": pane.raw_display_bits,
+                "black": pane.raw_black_level,
+                "white": pane.raw_white_level,
+                "exposure": pane.raw_exposure_gain,
+                "wb_enabled": pane.raw_wb_enabled,
+                "adjustments": dict(pane.params),
+            }
             cfg = parse_raw_metadata_txt(txt_path, os.path.basename(pane.source_path))
             frame_id = cfg.get("metadata_frame_id")
             frame_text = "" if frame_id is None else f" ID:{frame_id}"
@@ -2129,9 +2165,13 @@ class Window(QMainWindow):
             def done_cb(f):
                 try:
                     rgb, raw_info = f.result()
-                    self.metadata_load_done.emit(pane, raw_path, txt_path, rgb, raw_info)
+                    self.metadata_load_done.emit(
+                        pane, raw_path, txt_path, display_state, rgb, raw_info
+                    )
                 except Exception as e:
-                    self.metadata_load_done.emit(pane, raw_path, txt_path, None, e)
+                    self.metadata_load_done.emit(
+                        pane, raw_path, txt_path, display_state, None, e
+                    )
 
             fut.add_done_callback(done_cb)
         except Exception as e:
@@ -2140,7 +2180,8 @@ class Window(QMainWindow):
             self.msg.setText(text)
 
     def _on_metadata_load_done(
-        self, pane: Pane, raw_path: str, txt_path: str, rgb: Optional[np.ndarray], raw_or_err
+        self, pane: Pane, raw_path: str, txt_path: str, display_state: dict,
+        rgb: Optional[np.ndarray], raw_or_err
     ):
         pane_id = "left" if pane is self.left else "right"
         if pane.source_path != raw_path:
@@ -2151,11 +2192,45 @@ class Window(QMainWindow):
             self.msg.setText(text)
             return
 
-        self._on_load_done(pane, raw_path, rgb, raw_or_err)
         wb = tuple(float(v) for v in raw_or_err.get("wb", (1.0, 1.0, 1.0)))
+        pane.set_baseline(raw_path, rgb, raw_or_err)
+        pane.raw_channel_mode = str(display_state["channel"])
+        pane.raw_display_bits = int(display_state["bit"])
+        pane.raw_black_level = int(display_state["black"])
+        pane.raw_white_level = int(display_state["white"])
+        pane.raw_exposure_gain = float(display_state["exposure"])
+        pane.raw_wb_enabled = bool(display_state["wb_enabled"])
+        pane.raw_wb = wb
+        pane.params = dict(display_state["adjustments"])
+
+        self.raw_adj_panel.blockSignals(True)
+        try:
+            self.raw_adj_panel.set_values(
+                pane_id,
+                pane.raw_channel_mode,
+                pane.raw_display_bits,
+                pane.raw_black_level,
+                pane.raw_white_level,
+                pane.raw_exposure_gain,
+                pane.raw_wb_enabled,
+                wb[0], wb[1], wb[2],
+            )
+        finally:
+            self.raw_adj_panel.blockSignals(False)
+        self._refresh_raw_controls_ui()
+
+        if pane.raw_channel_mode == "ALL":
+            self._submit_adjust_render(pane, preview=False)
+        else:
+            pane.render_current(reset_view=False)
+
         frame_id = raw_or_err.get("metadata_frame_id")
         frame_text = "" if frame_id is None else f" ID:{frame_id}"
-        result = f"已重新加载{frame_text}  WB {wb[0]:.6f}, {wb[1]:.6f}, {wb[2]:.6f}"
+        wb_state = "开" if pane.raw_wb_enabled else "关"
+        result = (
+            f"已导入{frame_text}  WB {wb[0]:.6f}, {wb[1]:.6f}, {wb[2]:.6f}  "
+            f"显示 {pane.raw_display_bits}-bit / WB {wb_state}"
+        )
         self.raw_adj_panel.show_metadata_result(pane_id, result, True)
         self.msg.setText(result)
 
