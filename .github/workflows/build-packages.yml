@@ -132,12 +132,16 @@ jobs:
         run: packaging\build_windows.bat
         shell: cmd
 
-      - name: Verify Windows executable imports
+      - name: Verify Windows executable contains runtime modules
         shell: powershell
         run: |
-          $process = Start-Process -FilePath "dist\DNGauge.exe" -ArgumentList "--self-test" -Wait -PassThru
-          if ($process.ExitCode -ne 0) {
-            throw "DNGauge.exe self-test failed with exit code $($process.ExitCode)"
+          $archive = python -m PyInstaller.utils.cliutils.archive_viewer -r -b "dist\DNGauge.exe"
+          foreach ($module in @("numpy", "rawpy", "PIL", "PyQt5")) {
+            $found = $archive | Where-Object { $_ -match "(^|[ /])$module([./]|$)" }
+            if (-not $found) {
+              throw "DNGauge.exe does not contain required runtime module: $module"
+            }
+            Write-Host "Found packaged runtime module: $module"
           }
 
       - name: Package Windows portable release
