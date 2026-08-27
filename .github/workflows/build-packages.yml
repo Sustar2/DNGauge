@@ -137,11 +137,14 @@ jobs:
         run: |
           $archive = python -m PyInstaller.utils.cliutils.archive_viewer -r -b "dist\DNGauge.exe"
           foreach ($module in @("numpy", "rawpy", "PIL", "PyQt5")) {
-            $found = $archive | Where-Object { $_ -match "(^|[ /])$module([./]|$)" }
+            # PyInstaller's archive viewer formats Windows entries differently
+            # across releases (quotes and path separators vary), so match the
+            # module name itself instead of assuming one output format.
+            $found = $archive | Where-Object { $_ -like "*$module*" }
             if (-not $found) {
               throw "DNGauge.exe does not contain required runtime module: $module"
             }
-            Write-Host "Found packaged runtime module: $module"
+            Write-Host "Found packaged runtime module: $module ($(@($found)[0]))"
           }
 
       - name: Package Windows portable release
