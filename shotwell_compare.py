@@ -41,6 +41,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QTabWidget,
@@ -1976,12 +1977,46 @@ class Window(QMainWindow):
         mid.addWidget(self.left, 1)
         mid.addWidget(self.right, 1)
         self.adj_container = QWidget()
+        self.adj_container.setObjectName("adjustContainer")
         adj_col = QVBoxLayout(self.adj_container)
         adj_col.setContentsMargins(0, 0, 0, 0)
         adj_col.addWidget(self.left_adj)
         adj_col.addWidget(self.right_adj)
         adj_col.addWidget(self.raw_adj_panel)
-        mid.addWidget(self.adj_container)
+        self.adj_scroll = QScrollArea()
+        self.adj_scroll.setWidgetResizable(True)
+        self.adj_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.adj_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.adj_scroll.setSizeAdjustPolicy(QScrollArea.AdjustIgnored)
+        self.adj_scroll.setMinimumWidth(280)
+        self.adj_scroll.setStyleSheet("""
+            QScrollArea,
+            QWidget#qt_scrollarea_viewport,
+            QWidget#adjustContainer {
+                border: none;
+                background-color: #2b2b2b;
+            }
+            QScrollBar:vertical {
+                width: 12px;
+                margin: 0;
+                background-color: #2b2b2b;
+            }
+            QScrollBar::handle:vertical {
+                min-height: 28px;
+                border-radius: 5px;
+                background-color: #555555;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+        """)
+        self.adj_scroll.setWidget(self.adj_container)
+        mid.addWidget(self.adj_scroll)
 
         root = QWidget()
         lay = QVBoxLayout(root)
@@ -2078,7 +2113,7 @@ class Window(QMainWindow):
         self._update_adjust_panel_visibility()
 
     def _update_adjust_panel_visibility(self):
-        self.adj_container.setVisible(self._adjust_visible)
+        self.adj_scroll.setVisible(self._adjust_visible)
         if not self._adjust_visible:
             return
         if self._single_view:
