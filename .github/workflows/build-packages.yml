@@ -120,13 +120,18 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install "pyinstaller<7"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify Windows build dependencies
         run: |
           python -c "import numpy, rawpy, PIL, PyQt5; print('numpy', numpy.__version__); print('rawpy', rawpy.__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip show numpy rawpy pyinstaller
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Windows executable
         run: packaging\build_windows.bat
