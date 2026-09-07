@@ -43,6 +43,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -1207,6 +1208,33 @@ class SyncView(QGraphicsView):
         self._emit_state()
 
 
+class ElidedPathLabel(QLabel):
+    """A path label whose full text never dictates the window width."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full_text = text
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._update_elided_text()
+
+    def set_path(self, path: str):
+        self._full_text = path
+        self.setToolTip(path)
+        self._update_elided_text()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_elided_text()
+
+    def _update_elided_text(self):
+        available = max(0, self.contentsRect().width())
+        shown = self.fontMetrics().elidedText(self._full_text, Qt.ElideMiddle, available)
+        if self.text() != shown:
+            super().setText(shown)
+
+
 class Pane(QWidget):
     state_changed = pyqtSignal(object)
     pixel_picked = pyqtSignal(object)
@@ -1214,9 +1242,13 @@ class Pane(QWidget):
 
     def __init__(self, title: str):
         super().__init__()
+        # The two panes must be allowed to shrink when the adjustment sidebar is
+        # opened.  Otherwise child size hints can force a maximized window past
+        # the edge of the current monitor.
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.t = QLabel(title)
-        self.p = QLabel("未加载")
-        self.p.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.p = ElidedPathLabel("未加载")
         self.v = SyncView()
         self.source_path: Optional[str] = None
         self.base_rgb: Optional[np.ndarray] = None
@@ -1242,7 +1274,7 @@ class Pane(QWidget):
 
     def set_baseline(self, path: str, rgb: np.ndarray, raw_info: Optional[dict] = None):
         self.source_path = path
-        self.p.setText(path)
+        self.p.set_path(path)
         self.base_rgb = np.ascontiguousarray(rgb.astype(np.uint8, copy=False))
         self.raw_info = raw_info
         if self.raw_info is not None:
