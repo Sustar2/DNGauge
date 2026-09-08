@@ -1815,12 +1815,14 @@ class RawAdjustPanel(QGroupBox):
             drop.reset_result()
 
 class RawLoadConfigDialog(QDialog):
-    def __init__(self, parent=None, default_text: str = "4096,3072,10,RGGB,u16", filename: str = ""):
+    def __init__(self, parent=None, default_text: str = "4096,3072,10,RGGB,u16", raw_path: str = ""):
         super().__init__(parent)
         self.setWindowTitle("RAW 加载配置")
         self.resize(440, 390)
         self.setAcceptDrops(True)
-        self.raw_filename = filename
+        self.raw_path = os.path.abspath(raw_path) if raw_path else ""
+        self.raw_filename = os.path.basename(self.raw_path)
+        self.raw_dir = os.path.dirname(self.raw_path) if self.raw_path else os.getcwd()
         self._metadata_cfg = {}
         self.setStyleSheet("""
             QDialog, QWidget { color: #000000; background: #ffffff; }
@@ -1839,7 +1841,7 @@ class RawLoadConfigDialog(QDialog):
                 pass
 
         form = QFormLayout()
-        tip = QLabel(f"文件: {filename}")
+        tip = QLabel(f"文件: {self.raw_filename}")
         form.addRow("文件", tip)
 
         self.sp_w = QSpinBox(); self.sp_w.setRange(1, 20000); self.sp_w.setValue(w0)
@@ -1855,9 +1857,12 @@ class RawLoadConfigDialog(QDialog):
         form.addRow("Packing", self.cb_k)
 
         self.meta_drop = MetadataDropLabel()
-        self.meta_drop.setText("把 metadata TXT 拖到这里\n自动读取 RAW 配置和白平衡")
+        self.meta_drop.setText("把 metadata TXT 拖到这里\n或点击下方按钮选择")
         self.meta_drop.setMinimumHeight(100)
         self.meta_drop.file_dropped.connect(self._apply_metadata_txt)
+
+        self.btn_pick_metadata = QPushButton("选择 metadata TXT")
+        self.btn_pick_metadata.clicked.connect(self._pick_metadata_txt)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -1866,7 +1871,18 @@ class RawLoadConfigDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addLayout(form)
         lay.addWidget(self.meta_drop)
+        lay.addWidget(self.btn_pick_metadata)
         lay.addWidget(buttons)
+
+    def _pick_metadata_txt(self):
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "选择 metadata TXT",
+            self.raw_dir,
+            "Metadata TXT (*.txt);;All Files (*)",
+        )
+        if path:
+            self._apply_metadata_txt(path)
 
     def dragEnterEvent(self, event):
         md = event.mimeData()
@@ -2584,7 +2600,7 @@ class Window(QMainWindow):
         self._load_path_into_pane(pane, path)
 
     def _ask_plain_raw_cfg(self, path: str) -> Optional[dict]:
-        dlg = RawLoadConfigDialog(self, default_text=self._plain_raw_cfg_text, filename=os.path.basename(path))
+        dlg = RawLoadConfigDialog(self, default_text=self._plain_raw_cfg_text, raw_path=path)
         if dlg.exec_() != QDialog.Accepted:
             return None
         try:
