@@ -490,9 +490,26 @@ def _plain_raw_temp_dng_to_rgb(
     if not PIDNG_AVAILABLE:
         return None
 
-    bits_per_sample = max(1, min(16, int(bit)))
-    tag_white = int(max(1.0, min(float((1 << bits_per_sample) - 1), float(white_level))))
-    tag_black = int(max(0.0, min(float(tag_white - 1), float(black_level))))
+    source_bits = max(1, min(16, int(bit)))
+    source_white = int(max(1.0, min(float((1 << source_bits) - 1), float(white_level))))
+    source_black = int(max(0.0, min(float(source_white - 1), float(black_level))))
+
+    # PiDNG packs 10/12/14-bit tiles. LibRaw 0.22 on Windows can identify
+    # those generated DNGs but unpacks their pixel plane as all zero. Store the
+    # internal interchange DNG as uncompressed 16-bit instead. Left-shifting
+    # both samples and levels preserves the source RAW's normalized values.
+    storage_shift = 16 - source_bits
+    if storage_shift:
+        source_max = (1 << source_bits) - 1
+        dng_raw = np.left_shift(
+            np.minimum(raw, source_max).astype(np.uint16, copy=False),
+            storage_shift,
+        )
+    else:
+        dng_raw = raw.astype(np.uint16, copy=False)
+    dng_raw = np.ascontiguousarray(dng_raw)
+    tag_black = source_black << storage_shift
+    tag_white = source_white << storage_shift
 
     tags = DNGTags()
     tags.set(Tag.ImageLength, int(raw.shape[0]))
@@ -502,7 +519,7 @@ def _plain_raw_temp_dng_to_rgb(
     tags.set(Tag.Orientation, Orientation.Horizontal)
     tags.set(Tag.PhotometricInterpretation, PhotometricInterpretation.Color_Filter_Array)
     tags.set(Tag.SamplesPerPixel, 1)
-    tags.set(Tag.BitsPerSample, bits_per_sample)
+    tags.set(Tag.BitsPerSample, 16)
     tags.set(Tag.CFARepeatPatternDim, [2, 2])
     tags.set(Tag.CFAPattern, _pattern_to_pidng(pattern))
     tags.set(Tag.BlackLevel, tag_black)
@@ -523,7 +540,7 @@ def _plain_raw_temp_dng_to_rgb(
         dng_path = os.path.join(temp_dir, "preview.dng")
         writer = RAW2DNG()
         writer.options(tags, path="", compress=False)
-        generated_path = writer.convert(raw, filename=dng_path)
+        generated_path = writer.convert(dng_raw, filename=dng_path)
         dng_path = os.path.abspath(generated_path or dng_path)
         if not os.path.isfile(dng_path):
             raise FileNotFoundError(f"PiDNG 未生成临时 DNG: {dng_path}")
