@@ -45,6 +45,7 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSizePolicy,
     QSpinBox,
+    QStyle,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -517,7 +518,10 @@ def _plain_raw_temp_dng_to_rgb(
     tags.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
     tags.set(Tag.PreviewColorSpace, PreviewColorSpace.sRGB)
 
-    fd, tmp_path = tempfile.mkstemp(prefix="dng_compare_", suffix=".dng", dir="/tmp")
+    # Let Python choose the platform's temporary directory.  Hard-coding /tmp
+    # works on Linux but prevents the same PiDNG -> rawpy path from running on
+    # Windows, where the temp directory is normally under %TEMP%.
+    fd, tmp_path = tempfile.mkstemp(prefix="dng_compare_", suffix=".dng")
     os.close(fd)
     try:
         writer = RAW2DNG()
@@ -981,6 +985,8 @@ class SyncView(QGraphicsView):
         self._interp = 0.0
         self._probe_enabled = False
         self._in_resize = False
+        self._applying_synced_state = False
+        self._resize_sync_pending = False
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._finish_resize_update)
@@ -992,14 +998,21 @@ class SyncView(QGraphicsView):
         return not self.item.pixmap().isNull()
 
     def set_image(self, qimg: QImage, fit: bool = False):
-        self.item.setPixmap(QPixmap.fromImage(qimg))
-        self.scene().setSceneRect(self.item.boundingRect())
-        self.overlay_item.setPos(0, 0)
-        self.resetTransform()
-        self._interp = 0.0
-        if fit:
-            self.fitInView(self.item, Qt.KeepAspectRatio)
-        self._emit_state()
+        # Replacing the pixmap resets the transform and both scroll bars.  Those
+        # are intermediate states; publishing them makes the linked pane jump to
+        # 1:1 and back before the caller restores the actual view state.
+        previous_suppress = self._suppress
+        self._suppress = True
+        try:
+            self.item.setPixmap(QPixmap.fromImage(qimg))
+            self.scene().setSceneRect(self.item.boundingRect())
+            self.overlay_item.setPos(0, 0)
+            self.resetTransform()
+            self._interp = 0.0
+            if fit:
+                self.fitInView(self.item, Qt.KeepAspectRatio)
+        finally:
+            self._suppress = previous_suppress
 
     def set_overlay_pixmap(self, pixmap: QPixmap):
         self.overlay_item.setPixmap(pixmap)
@@ -1058,6 +1071,10 @@ class SyncView(QGraphicsView):
         super().resizeEvent(e)
         # 避免窗口放大/全屏时触发大量同步事件导致卡死
         self._in_resize = True
+        # A resize caused by applying the other pane's state must not be sent
+        # back after the debounce timer, or the two panes can start ping-ponging.
+        if not self._applying_synced_state:
+            self._resize_sync_pending = True
         self._resize_timer.start(80)
 
     def mouseReleaseEvent(self, e):
@@ -1116,6 +1133,7 @@ class SyncView(QGraphicsView):
         if not self.has_image():
             return
         self._suppress = True
+        self._applying_synced_state = True
         try:
             target = self._clamp_zoom(s.zoom)
             self._interp = self._interp_for_zoom(target)
@@ -1127,6 +1145,7 @@ class SyncView(QGraphicsView):
             if v.maximum() > 0:
                 v.setValue(int(s.y_ratio * v.maximum()))
         finally:
+            self._applying_synced_state = False
             self._suppress = False
 
     def _snap_interp(self, interp: float) -> float:
@@ -1140,7 +1159,16 @@ class SyncView(QGraphicsView):
     def _min_factor(self) -> float:
         pix = self.item.pixmap()
         iw, ih = pix.width(), pix.height()
-        vw, vh = self.viewport().width(), self.viewport().height()
+        # Use a stable viewport size that reserves room for both scroll bars.
+        # QGraphicsView's live viewport grows/shrinks as automatic scroll bars
+        # disappear/appear.  Feeding that changing size back into the zoom
+        # calculation can make a fit-boundary scale alternate forever.
+        scrollbar_extent = self.style().pixelMetric(
+            QStyle.PM_ScrollBarExtent, None, self
+        )
+        frame_extent = 2 * self.frameWidth()
+        vw = max(1, self.width() - frame_extent - scrollbar_extent)
+        vh = max(1, self.height() - frame_extent - scrollbar_extent)
         if iw <= 0 or ih <= 0 or vw <= 0 or vh <= 0:
             return 1.0
         min_factor = min(vw / float(iw), vh / float(ih))
@@ -1174,7 +1202,15 @@ class SyncView(QGraphicsView):
     def _apply_zoom_from_interp(self):
         target = self._zoom_for_interp(self._interp)
         # 用绝对变换，避免反复 scale() 累积误差/极端比例导致的不稳定
-        self.setTransform(QTransform.fromScale(target, target))
+        # setTransform() updates horizontal and vertical scroll bars separately.
+        # Suppress those half-updated states; the initiating operation emits one
+        # complete state after the transform has settled.
+        previous_suppress = self._suppress
+        self._suppress = True
+        try:
+            self.setTransform(QTransform.fromScale(target, target))
+        finally:
+            self._suppress = previous_suppress
 
     def _pick_pixel(self, pos):
         if not self.has_image():
@@ -1202,10 +1238,13 @@ class SyncView(QGraphicsView):
 
     def _finish_resize_update(self):
         self._in_resize = False
+        should_emit = self._resize_sync_pending
+        self._resize_sync_pending = False
         if self.has_image():
             # Shotwell 逻辑：窗口变化后保持同一缩放档位
             self._apply_zoom_from_interp()
-        self._emit_state()
+        if should_emit:
+            self._emit_state()
 
 
 class ElidedPathLabel(QLabel):
