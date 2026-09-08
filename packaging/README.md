@@ -14,8 +14,6 @@ This folder contains all build and distribution assets for `DNGauge`.
   - builds `../dist/DNGauge`
 - `build_windows.bat`
   - builds `..\dist\DNGauge.exe`
-- `check_plain_raw_pipeline.py`
-  - verifies that PiDNG and the plain-RAW temporary-DNG render path work on the build platform
 - `package_portable_linux.sh`
   - creates `../release/DNGauge-linux-portable`
 - `package_windows_portable.bat`

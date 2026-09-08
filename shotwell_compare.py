@@ -517,18 +517,21 @@ def _plain_raw_temp_dng_to_rgb(
     tags.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
     tags.set(Tag.PreviewColorSpace, PreviewColorSpace.sRGB)
 
-    # PiDNG expects its output directory and file name separately. Passing an
-    # absolute Windows path as ``filename`` can make the generated path differ
-    # from the path handed to rawpy. A private directory also avoids creating an
-    # empty placeholder file before PiDNG writes the DNG.
+    # Match the Windows-verified batch_raw_to_dng.py convention: keep PiDNG's
+    # base path empty and pass the complete output filename to convert().
     with tempfile.TemporaryDirectory(prefix="dng_compare_") as temp_dir:
+        dng_path = os.path.join(temp_dir, "preview.dng")
         writer = RAW2DNG()
-        writer.options(tags, path=temp_dir, compress=False)
-        generated_path = writer.convert(raw, filename="preview.dng")
-        dng_path = os.path.abspath(generated_path)
+        writer.options(tags, path="", compress=False)
+        generated_path = writer.convert(raw, filename=dng_path)
+        dng_path = os.path.abspath(generated_path or dng_path)
         if not os.path.isfile(dng_path):
             raise FileNotFoundError(f"PiDNG 未生成临时 DNG: {dng_path}")
-        rgb, _raw_info = ShotwellRawDecoder._load_raw(dng_path, target_size=None)
+        rgb, _raw_info = ShotwellRawDecoder._load_raw(
+            dng_path,
+            target_size=None,
+            camera_wb_only=True,
+        )
         return rgb
 
 
@@ -685,11 +688,13 @@ class ShotwellRawDecoder:
     """Shotwell-like RAW decode, aligned to GRaw.configure_for_rgb_display()."""
 
     @staticmethod
-    def _rawpy_kwargs(half_size: bool = False):
+    def _rawpy_kwargs(half_size: bool = False, camera_wb_only: bool = False):
         k = {
             "bright": 1.0,
             "half_size": half_size,
-            "use_auto_wb": True,
+            # rawpy gives auto WB priority when both flags are True. Generated
+            # DNG files must honor the AsShotNeutral tag written above.
+            "use_auto_wb": not camera_wb_only,
             "use_camera_wb": True,
             "output_color": getattr(rawpy.ColorSpace, "sRGB", None),
             "output_bps": 8,
@@ -897,12 +902,22 @@ class ShotwellRawDecoder:
         return np.ascontiguousarray(rgb), raw_info
 
     @classmethod
-    def _load_raw(cls, path: str, target_size: Optional[tuple[int, int]] = None) -> tuple[np.ndarray, Optional[dict]]:
+    def _load_raw(
+        cls,
+        path: str,
+        target_size: Optional[tuple[int, int]] = None,
+        camera_wb_only: bool = False,
+    ) -> tuple[np.ndarray, Optional[dict]]:
         with rawpy.imread(path) as raw:
             # 为了与 Shotwell 在单图查看时的放大范围一致，这里固定用 full-size 解码。
             # 否则 half_size 会让源分辨率减半，导致“最大缩放看起来不够近”。 
             half_size = False
-            rgb = raw.postprocess(**cls._rawpy_kwargs(half_size=half_size))
+            rgb = raw.postprocess(
+                **cls._rawpy_kwargs(
+                    half_size=half_size,
+                    camera_wb_only=camera_wb_only,
+                )
+            )
             raw_visible = np.ascontiguousarray(raw.raw_image_visible.copy())
             cfa_visible = np.ascontiguousarray(raw.raw_colors_visible.copy())
             desc = getattr(raw, "color_desc", b"RGBG")

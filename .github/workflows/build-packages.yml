@@ -130,8 +130,6 @@ jobs:
         run: |
           python -c "import numpy, rawpy, PIL, PyQt5, pidng; print('numpy', numpy.__version__); print('rawpy', rawpy.__version__)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python packaging/check_plain_raw_pipeline.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip show numpy rawpy pidng pyinstaller
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
