@@ -451,6 +451,12 @@ def dng_style_linear_rgb_to_srgb(
     gains = np.where(gains > 1e-6, gains, 1.0)
     arr *= gains.reshape(1, 1, 3)
     arr = arr @ DNG_STYLE_CCM.T
+    if sys.platform == "win32":
+        # Preserve a neutral input as neutral in the Windows-only emergency
+        # fallback. Keep Linux's established rendering math unchanged.
+        neutral_response = DNG_STYLE_CCM @ np.ones(3, dtype=np.float32)
+        neutral_response = np.where(np.abs(neutral_response) > 1e-6, neutral_response, 1.0)
+        arr /= neutral_response.reshape(1, 1, 3)
     arr *= np.float32(2.0 ** -1.5)
     arr = np.clip(arr, 0.0, 1.0)
     srgb = np.where(arr <= 0.0031308, arr * 12.92, 1.055 * np.power(arr, 1.0 / 2.4) - 0.055)
@@ -490,36 +496,26 @@ def _plain_raw_temp_dng_to_rgb(
     if not PIDNG_AVAILABLE:
         return None
 
-    source_bits = max(1, min(16, int(bit)))
-    source_white = int(max(1.0, min(float((1 << source_bits) - 1), float(white_level))))
-    source_black = int(max(0.0, min(float(source_white - 1), float(black_level))))
-
-    # PiDNG packs 10/12/14-bit tiles. LibRaw 0.22 on Windows can identify
-    # those generated DNGs but unpacks their pixel plane as all zero. Store the
-    # internal interchange DNG as uncompressed 16-bit instead. Left-shifting
-    # both samples and levels preserves the source RAW's normalized values.
-    storage_shift = 16 - source_bits
-    if storage_shift:
-        source_max = (1 << source_bits) - 1
-        dng_raw = np.left_shift(
-            np.minimum(raw, source_max).astype(np.uint16, copy=False),
-            storage_shift,
-        )
-    else:
-        dng_raw = raw.astype(np.uint16, copy=False)
-    dng_raw = np.ascontiguousarray(dng_raw)
-    tag_black = source_black << storage_shift
-    tag_white = source_white << storage_shift
+    bits_per_sample = max(1, min(16, int(bit)))
+    tag_white = int(max(1.0, min(float((1 << bits_per_sample) - 1), float(white_level))))
+    tag_black = int(max(0.0, min(float(tag_white - 1), float(black_level))))
 
     tags = DNGTags()
     tags.set(Tag.ImageLength, int(raw.shape[0]))
     tags.set(Tag.ImageWidth, int(raw.shape[1]))
-    tags.set(Tag.TileLength, int(raw.shape[0]))
-    tags.set(Tag.TileWidth, int(raw.shape[1]))
+    if sys.platform == "win32":
+        # GitHub PiDNG master (required for MSVC support) writes StripOffsets
+        # and StripByteCounts. Do not mix those with the old Tile geometry.
+        tags.set(Tag.RowsPerStrip, int(raw.shape[0]))
+    else:
+        # PyPI PiDNG 4.0.9 still writes tiled DNGs. Preserve the established
+        # Linux tags and output path exactly.
+        tags.set(Tag.TileLength, int(raw.shape[0]))
+        tags.set(Tag.TileWidth, int(raw.shape[1]))
     tags.set(Tag.Orientation, Orientation.Horizontal)
     tags.set(Tag.PhotometricInterpretation, PhotometricInterpretation.Color_Filter_Array)
     tags.set(Tag.SamplesPerPixel, 1)
-    tags.set(Tag.BitsPerSample, 16)
+    tags.set(Tag.BitsPerSample, bits_per_sample)
     tags.set(Tag.CFARepeatPatternDim, [2, 2])
     tags.set(Tag.CFAPattern, _pattern_to_pidng(pattern))
     tags.set(Tag.BlackLevel, tag_black)
@@ -540,14 +536,14 @@ def _plain_raw_temp_dng_to_rgb(
         dng_path = os.path.join(temp_dir, "preview.dng")
         writer = RAW2DNG()
         writer.options(tags, path="", compress=False)
-        generated_path = writer.convert(dng_raw, filename=dng_path)
+        generated_path = writer.convert(raw, filename=dng_path)
         dng_path = os.path.abspath(generated_path or dng_path)
         if not os.path.isfile(dng_path):
             raise FileNotFoundError(f"PiDNG 未生成临时 DNG: {dng_path}")
         rgb, _raw_info = ShotwellRawDecoder._load_raw(
             dng_path,
             target_size=None,
-            camera_wb_only=True,
+            camera_wb_only=(sys.platform == "win32"),
         )
         return rgb
 
@@ -564,17 +560,23 @@ def render_plain_raw_with_matrix(
     bit: Optional[int] = None,
 ) -> np.ndarray:
     if prefer_temp_dng and PIDNG_AVAILABLE:
-        rgb = _plain_raw_temp_dng_to_rgb(
-            raw,
-            pattern=pattern,
-            bit=(bit if bit is not None else int(np.ceil(np.log2(max(2.0, float(white_level) + 1.0))))),
-            black_level=black_level,
-            white_level=white_level,
-            wb_enabled=wb_enabled,
-            wb=wb,
-        )
-        if rgb is not None:
-            return rgb
+        try:
+            rgb = _plain_raw_temp_dng_to_rgb(
+                raw,
+                pattern=pattern,
+                bit=(bit if bit is not None else int(np.ceil(np.log2(max(2.0, float(white_level) + 1.0))))),
+                black_level=black_level,
+                white_level=white_level,
+                wb_enabled=wb_enabled,
+                wb=wb,
+            )
+            if rgb is not None and rgb.size and int(rgb.max()) > 0:
+                return rgb
+        except Exception as exc:
+            # A temporary-DNG failure must not make a plain RAW impossible to
+            # open. This is particularly important for Windows LibRaw builds
+            # that reject or misread PiDNG's generated pixel storage.
+            print(f"Temporary DNG render failed; using direct RAW fallback: {exc}", file=sys.stderr)
 
     linear_rgb, _cfa = ShotwellRawDecoder._demosaic_bilinear_linear(raw, pattern)
     gains = wb if wb_enabled else (1.0, 1.0, 1.0)

@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import importlib.util
 import os
 from pathlib import Path
 
@@ -9,7 +10,8 @@ SCRIPT_DIR = (Path(os.getcwd()) / "packaging").resolve()
 PROJECT_ROOT = SCRIPT_DIR.parent
 
 hiddenimports = ["numpy", "numpy.core._multiarray_umath"]
-hiddenimports += collect_submodules("pidng")
+if importlib.util.find_spec("pidng") is not None:
+    hiddenimports += collect_submodules("pidng")
 hiddenimports += collect_submodules("rawpy")
 
 binaries = []

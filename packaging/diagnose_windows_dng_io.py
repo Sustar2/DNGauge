@@ -65,8 +65,11 @@ def write_test_dng(path: Path, storage_bits: int = 12) -> None:
     tags = DNGTags()
     tags.set(Tag.ImageLength, raw.shape[0])
     tags.set(Tag.ImageWidth, raw.shape[1])
-    tags.set(Tag.TileLength, raw.shape[0])
-    tags.set(Tag.TileWidth, raw.shape[1])
+    if sys.platform == "win32":
+        tags.set(Tag.RowsPerStrip, raw.shape[0])
+    else:
+        tags.set(Tag.TileLength, raw.shape[0])
+        tags.set(Tag.TileWidth, raw.shape[1])
     tags.set(Tag.Orientation, Orientation.Horizontal)
     tags.set(Tag.PhotometricInterpretation, PhotometricInterpretation.Color_Filter_Array)
     tags.set(Tag.SamplesPerPixel, 1)

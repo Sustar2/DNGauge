@@ -75,7 +75,8 @@ pip install -r requirements.txt
 ```
 
 Notes:
-- `pidng` is required for the internal temporary-DNG pipeline used by plain `.RAW` preview.
+- Linux keeps the PyPI `pidng==4.0.9` tiled-DNG pipeline. Windows uses a pinned
+  GitHub PiDNG commit with MSVC support and writes strip-based temporary DNGs.
 - `run.sh` assumes a local conda environment named `dng_compare`.
 
 ---
