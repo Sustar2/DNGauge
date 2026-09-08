@@ -517,19 +517,19 @@ def _plain_raw_temp_dng_to_rgb(
     tags.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
     tags.set(Tag.PreviewColorSpace, PreviewColorSpace.sRGB)
 
-    fd, tmp_path = tempfile.mkstemp(prefix="dng_compare_", suffix=".dng", dir="/tmp")
-    os.close(fd)
-    try:
+    # PiDNG expects its output directory and file name separately. Passing an
+    # absolute Windows path as ``filename`` can make the generated path differ
+    # from the path handed to rawpy. A private directory also avoids creating an
+    # empty placeholder file before PiDNG writes the DNG.
+    with tempfile.TemporaryDirectory(prefix="dng_compare_") as temp_dir:
         writer = RAW2DNG()
-        writer.options(tags, path="", compress=False)
-        writer.convert(raw, filename=tmp_path)
-        rgb, _raw_info = ShotwellRawDecoder._load_raw(tmp_path, target_size=None)
+        writer.options(tags, path=temp_dir, compress=False)
+        generated_path = writer.convert(raw, filename="preview.dng")
+        dng_path = os.path.abspath(generated_path)
+        if not os.path.isfile(dng_path):
+            raise FileNotFoundError(f"PiDNG 未生成临时 DNG: {dng_path}")
+        rgb, _raw_info = ShotwellRawDecoder._load_raw(dng_path, target_size=None)
         return rgb
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
 
 
 def render_plain_raw_with_matrix(
